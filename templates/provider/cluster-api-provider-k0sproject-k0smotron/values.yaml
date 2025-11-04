@@ -1,0 +1,15 @@
+configSecret:
+  create: false
+  name: ""
+  namespace: ""
+
+config: {}
+
+infrastructure:
+  manager: {}
+
+bootstrap:
+  manager: {}
+
+controlPlane:
+  manager: {}

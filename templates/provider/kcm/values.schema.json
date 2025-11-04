@@ -1,0 +1,343 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A KCM provider kcm template",
+  "type": "object",
+  "properties": {
+    "admissionWebhook": {
+      "type": "object",
+      "properties": {
+        "certDir": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer"
+        }
+      }
+    },
+    "containerSecurityContext": {
+      "type": "object",
+      "properties": {
+        "allowPrivilegeEscalation": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "type": "object",
+          "properties": {
+            "drop": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "controller": {
+      "type": "object",
+      "properties": {
+        "affinity": {
+          "description": "Affinity rules for pod scheduling",
+          "type": "object"
+        },
+        "createAccessManagement": {
+          "type": "boolean"
+        },
+        "createManagement": {
+          "type": "boolean"
+        },
+        "createRelease": {
+          "type": "boolean"
+        },
+        "createTemplates": {
+          "type": "boolean"
+        },
+        "debug": {
+          "type": "object",
+          "properties": {
+            "pprofBindAddress": {
+              "title": "Set pprof binding address",
+              "description": "The TCP address that the controller should bind to for serving pprof, '0' or empty value disables pprof",
+              "type": "string",
+              "pattern": "(?:^0?$)|(?:^(?:[\\w.-]+(?:\\.?[\\w\\.-]+)+)?:(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$)"
+            }
+          }
+        },
+        "defaultHelmTimeout": {
+          "description": "Specifies the timeout duration for Helm install or upgrade operations. If unset, Flux’s default value will be used",
+          "type": "string"
+        },
+        "enableSveltosCtrl": {
+          "description": "Enables built-in ServiceSet controller to reconcile ProjectSveltos objects",
+          "type": "boolean"
+        },
+        "enableSveltosExpiredCtrl": {
+          "description": "Enables SveltosCluster controller, updating stuck (expired) sveltos management cluster kubeconfig tokens",
+          "type": "boolean"
+        },
+        "globalK0sURL": {
+          "type": "string"
+        },
+        "globalRegistry": {
+          "type": "string"
+        },
+        "insecureRegistry": {
+          "type": "boolean"
+        },
+        "k0sURLCertSecret": {
+          "description": "Name of a Secret containing K0s Download URL Root CA with ca.crt key",
+          "type": "string"
+        },
+        "logger": {
+          "title": "Logger Settings",
+          "description": "Global controllers logger settings",
+          "type": "object",
+          "properties": {
+            "devel": {
+              "description": "Development defaults(encoder=console,logLevel=debug,stackTraceLevel=warn) Production defaults(encoder=json,logLevel=info,stackTraceLevel=error)",
+              "type": "boolean"
+            },
+            "encoder": {
+              "type": "string",
+              "enum": [
+                "json",
+                "console",
+                ""
+              ]
+            },
+            "log-level": {
+              "type": "string",
+              "enum": [
+                "info",
+                "debug",
+                "error",
+                ""
+              ]
+            },
+            "stacktrace-level": {
+              "type": "string",
+              "enum": [
+                "info",
+                "error",
+                "panic",
+                ""
+              ]
+            },
+            "time-encoding": {
+              "type": "string",
+              "enum": [
+                "epoch",
+                "millis",
+                "nano",
+                "iso8601",
+                "rfc3339",
+                "rfc3339nano",
+                ""
+              ]
+            }
+          }
+        },
+        "nodeSelector": {
+          "description": "Node selector to constrain the pod to run on specific nodes",
+          "type": "object"
+        },
+        "registryCertSecret": {
+          "description": "Name of a Secret containing Registry Root CA with ca.crt key",
+          "type": "string"
+        },
+        "registryCredsSecret": {
+          "description": "Name of a Secret containing Registry Credentials (Auth) Data",
+          "type": "string"
+        },
+        "templatesRepoURL": {
+          "type": "string"
+        },
+        "tolerations": {
+          "description": "Tolerations to allow the pod to schedule on tainted nodes",
+          "type": "array"
+        },
+        "validateClusterUpgradePath": {
+          "description": "Specifies whether the ClusterDeployment upgrade path should be validated",
+          "type": "boolean"
+        }
+      }
+    },
+    "flux2": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "helmController": {
+          "type": "object",
+          "properties": {
+            "container": {
+              "type": "object",
+              "properties": {
+                "additionalArgs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "imageAutomationController": {
+          "type": "object",
+          "properties": {
+            "create": {
+              "type": "boolean"
+            }
+          }
+        },
+        "imageReflectionController": {
+          "type": "object",
+          "properties": {
+            "create": {
+              "type": "boolean"
+            }
+          }
+        },
+        "kustomizeController": {
+          "type": "object",
+          "properties": {
+            "create": {
+              "type": "boolean"
+            }
+          }
+        },
+        "notificationController": {
+          "type": "object",
+          "properties": {
+            "create": {
+              "type": "boolean"
+            }
+          }
+        },
+        "policies": {
+          "type": "object",
+          "properties": {
+            "create": {
+              "type": "boolean"
+            }
+          }
+        },
+        "sourceController": {
+          "type": "object",
+          "properties": {
+            "container": {
+              "type": "object",
+              "properties": {
+                "additionalArgs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "fullnameOverride": {
+      "type": "string"
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "pullPolicy": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string"
+        }
+      }
+    },
+    "kubernetesClusterDomain": {
+      "type": "string"
+    },
+    "metricsService": {
+      "type": "object",
+      "properties": {
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "port": {
+                "type": "integer"
+              },
+              "protocol": {
+                "type": "string"
+              },
+              "targetPort": {
+                "type": "integer"
+              }
+            }
+          }
+        },
+        "type": {
+          "type": "string"
+        }
+      }
+    },
+    "nameOverride": {
+      "type": "string"
+    },
+    "rbac-manager": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "replicas": {
+      "type": "integer"
+    },
+    "resources": {
+      "type": "object",
+      "properties": {
+        "limits": {
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "type": "string"
+            },
+            "memory": {
+              "type": "string"
+            }
+          }
+        },
+        "requests": {
+          "type": "object",
+          "properties": {
+            "cpu": {
+              "type": "string"
+            },
+            "memory": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "annotations": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}

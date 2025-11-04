@@ -1,0 +1,135 @@
+name: CI
+on:
+  pull_request:
+    types:
+      - labeled
+      - opened
+      - synchronize
+      - reopened
+    branches:
+      - main
+      - '*-release'
+    paths-ignore:
+      - 'config/**'
+      - '**.md'
+  # push: # TODO: use if conditionals to separate PR from refs/tag for some steps; execute this WF BEFORE the releaese workflow
+  #   tags:
+  #     - '*'
+
+jobs:
+
+  lint-test:
+    concurrency:
+      group: lint-test-${{ github.head_ref || github.run_id }}
+      cancel-in-progress: true
+    name: Lint and Unit Test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      clusterprefix: ${{ steps.vars.outputs.clusterprefix }}
+      pr_merge_commit: ${{ fromJSON(steps.pr.outputs.result) }}
+    steps:
+      - name: Get PR ref
+        uses: actions/github-script@v8
+        id: pr
+        with:
+          script: |
+            const { data: pullRequest } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+            });
+            return pullRequest.merge_commit_sha;
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ fromJSON(steps.pr.outputs.result) }}
+          fetch-depth: 0
+
+
+      - name: Setup Go and Cache (with Lint)
+        uses: ./.github/actions/setup-go-cache
+
+
+      - name: Get outputs
+        id: vars
+        run: |
+          GIT_VERSION=$(git describe --tags --always)
+          echo "version=${GIT_VERSION:1}" >> "$GITHUB_OUTPUT"
+          echo "clusterprefix=ci-$(date +%s | cut -b6-10)" >> "$GITHUB_OUTPUT"
+
+  provider-cloud-e2etest:
+    name: E2E Cloud Providers
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cloud-${{ github.head_ref || github.run_id }}
+      cancel-in-progress: true
+    env:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${{ secrets.CI_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.CI_AWS_SECRET_ACCESS_KEY }}
+      AZURE_REGION: westus2
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.CI_AZURE_SUBSCRIPTION_ID }}
+      AZURE_TENANT_ID: ${{ secrets.CI_AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.CI_AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.CI_AZURE_CLIENT_SECRET }}
+      GCP_B64ENCODED_CREDENTIALS: ${{ secrets.CI_GCP_B64ENCODED_CREDENTIALS }}
+      GCP_PROJECT: k0rdent-ci
+      GCP_REGION: us-east4
+      PUBLIC_REPO: ${{ needs.authorize.outputs.public_repo == 'true' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.lint-test.outputs.pr_merge_commit }}
+
+      - name: Set public registry env variables
+        run: |
+          echo "IMG=ghcr.io/k0rdent/kcm/controller-ci:latest" >> $GITHUB_ENV
+          echo "cleanup"
+          sudo rm -rf /usr/lib/jvm && sudo rm -rf /usr/share/dotnet && sudo rm -rf /usr/local/.ghcup	&& sudo rm -rf /home/runner/.rustup && sudo rm -rf /usr/local/julia && sudo rm -rf /usr/local/lib/android/sdk && sudo rm -rf 	/opt/hostedtoolcache/CodeQL && sudo rm -rf
+
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Setup Go and Cache
+        uses: ./.github/actions/setup-go-cache
+
+      - name: Load testing configuration
+        run: |
+          echo "Testing configuration was NOT overwritten:"
+          cat test/e2e/config/config.yaml
+
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          detached: true
+
+      - name: Run E2E tests
+        env:
+          GINKGO_LABEL_FILTER: 'provider:cloud'
+          CLUSTER_DEPLOYMENT_PREFIX: ${{ needs.lint-test.outputs.clusterprefix }}
+          VERSION: ${{ needs.lint-test.outputs.version }}
+          SEGMENT_TOKEN: ${{ secrets.SEGMENT_TOKEN_DEV }}
+        run: make test-e2e
+
+
+  cleanup:
+    name: Cleanup
+    needs:
+      - lint-test
+      - provider-cloud-e2etest
+    runs-on: ubuntu-latest
+    if: ${{ always() && !contains(needs.provider-cloud-e2etest.result, 'skipped')}}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.lint-test.outputs.pr_merge_commit }}
+
+      - name: Setup Go and Cache
+        uses: ./.github/actions/setup-go-cache

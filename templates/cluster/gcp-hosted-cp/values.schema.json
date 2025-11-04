@@ -1,0 +1,348 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A KCM cluster gcp-hosted-cp template",
+  "type": "object",
+  "required": [
+    "project",
+    "region"
+  ],
+  "properties": {
+    "additionalLabels": {
+      "description": "Additional set of labels to add to all the GCP resources",
+      "type": "object",
+      "patternProperties": {
+        "^[a-zA-Z0-9._-]+$": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "auth": {
+      "description": "Authentication settings for the cluster, optional, auto-populated",
+      "type": "object",
+      "properties": {
+        "configSecret": {
+          "description": "Reference to the Secret containing the cluster’s AuthenticationConfiguration, auto-populated",
+          "type": "object",
+          "properties": {
+            "hash": {
+              "description": "Hash of the AuthenticationConfiguration data stored in the Secret, auto-populated",
+              "type": "string"
+            },
+            "key": {
+              "description": "The data key in the Secret that contains the AuthenticationConfiguration, auto-populated",
+              "type": "string"
+            },
+            "name": {
+              "description": "Name of the Secret that stores the AuthenticationConfiguration, auto-populated",
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "clusterAnnotations": {
+      "description": "Annotations to apply to the cluster",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "clusterIdentity": {
+      "description": "The GCP Service Account credentials secret reference, auto-populated",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "The GCP Service Account credentials secret name, auto-populated",
+          "type": "string"
+        }
+      }
+    },
+    "clusterLabels": {
+      "description": "Labels to apply to the cluster",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "clusterNetwork": {
+      "description": "The cluster network configuration",
+      "type": "object",
+      "properties": {
+        "apiServerPort": {
+          "description": "The port the API Server should bind to",
+          "type": "number",
+          "maximum": 65535,
+          "minimum": 1
+        },
+        "pods": {
+          "description": "The network ranges from which Pod networks are allocated",
+          "type": "object",
+          "properties": {
+            "cidrBlocks": {
+              "description": "A list of CIDR blocks",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "services": {
+          "description": "The network ranges from which service VIPs are allocated",
+          "type": "object",
+          "properties": {
+            "cidrBlocks": {
+              "description": "A list of CIDR blocks",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "controlPlaneNumber": {
+      "description": "The number of the control plane pods",
+      "type": "number",
+      "minimum": 1
+    },
+    "k0s": {
+      "description": "K0s parameters",
+      "type": "object",
+      "properties": {
+        "api": {
+          "description": "Kubernetes API server parameters",
+          "type": "object",
+          "properties": {
+            "extraArgs": {
+              "description": "Map of key-values (strings) for any extra arguments to pass down to Kubernetes api-server process",
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        },
+        "arch": {
+          "description": "K0s Download URL Arch",
+          "default": "amd64",
+          "type": "string",
+          "enum": [
+            "amd64",
+            "arm64",
+            "arm"
+          ]
+        },
+        "network": {
+          "description": "Kubernetes cluster network configuration",
+          "type": "object",
+          "properties": {
+            "calico": {
+              "description": "Calico-specific configuration",
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "description": "Calico network mode",
+                  "examples": [
+                    "ipip",
+                    "vxlan",
+                    "never"
+                  ],
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "additionalProperties": true
+            },
+            "provider": {
+              "description": "Network provider to use",
+              "examples": [
+                "kuberouter",
+                "calico",
+                "custom"
+              ],
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": true
+        },
+        "version": {
+          "description": "K0s version",
+          "type": "string"
+        },
+        "workerArgs": {
+          "description": "Args specifies extra arguments to be passed to k0s worker. See: https://docs.k0sproject.io/stable/worker-node-config/ See: https://docs.k0sproject.io/stable/cli/k0s_worker/",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "k0smotron": {
+      "description": "K0smotron parameters",
+      "type": "object",
+      "properties": {
+        "controllerPlaneFlags": {
+          "description": "ControlPlaneFlags allows to configure additional flags for k0s control plane and to override existing ones. The default flags are kept unless they are overriden explicitly. Flags with arguments must be specified as a single string, e.g. --some-flag=argument",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "service": {
+          "description": "The API service configuration",
+          "type": "object",
+          "properties": {
+            "apiPort": {
+              "description": "The kubernetes API port. If empty k0smotron will pick it automatically",
+              "type": "number",
+              "maximum": 65535,
+              "minimum": 1
+            },
+            "konnectivityPort": {
+              "description": "The konnectivity port. If empty k0smotron will pick it automatically",
+              "type": "number",
+              "maximum": 65535,
+              "minimum": 1
+            },
+            "type": {
+              "description": "An ingress methods for a service",
+              "default": "LoadBalancer",
+              "type": "string",
+              "enum": [
+                "ClusterIP",
+                "NodePort",
+                "LoadBalancer"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "network": {
+      "description": "The GCP network configuration",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "mtu": {
+          "description": "Maximum Transmission Unit in bytes",
+          "type": "number",
+          "maximum": 8896,
+          "minimum": 1300
+        },
+        "name": {
+          "description": "The name of an existing GCP network or a new network that will be created by Cluster API Provider GCP",
+          "type": "string"
+        }
+      }
+    },
+    "project": {
+      "description": "The name of the project to deploy the cluster to",
+      "type": "string"
+    },
+    "region": {
+      "description": "The GCP Region the cluster lives in",
+      "type": "string"
+    },
+    "worker": {
+      "description": "Worker parameters",
+      "type": "object",
+      "required": [
+        "instanceType"
+      ],
+      "properties": {
+        "additionalLabels": {
+          "description": "Additional set of labels to add to an instance, in addition to the ones added by default by the GCP provider. If both the GCPCluster and the GCPMachine specify the same tag name with different values, the GCPMachine's value takes precedence",
+          "type": "object",
+          "patternProperties": {
+            "^[a-zA-Z0-9._-]+$": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "additionalNetworkTags": {
+          "description": "A list of network tags that should be applied to the instance. These tags are set in addition to any network tags defined at the cluster level or in the actuator",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "image": {
+          "description": "The full reference to a valid image to be used for this machine. Takes precedence over imageFamily",
+          "type": "string"
+        },
+        "imageFamily": {
+          "description": "The full reference to a valid image family to be used for this machine",
+          "type": "string"
+        },
+        "instanceType": {
+          "description": "The type of instance to create. Example: n1.standard-2",
+          "type": "string"
+        },
+        "ipForwarding": {
+          "description": "IPForwarding allows this instance to send and receive packets with non-matching destination or source IPs. This is required if you plan to use this instance to forward routes. Defaults to Enabled",
+          "type": "string",
+          "enum": [
+            "Enabled",
+            "Disabled"
+          ]
+        },
+        "providerID": {
+          "description": "The unique identifier as specified by the cloud provider",
+          "type": "string"
+        },
+        "publicIP": {
+          "description": "PublicIP specifies whether the instance should get a public IP. Set this to true if you don't have a NAT instances or Cloud Nat setup",
+          "type": "boolean"
+        },
+        "rootDeviceSize": {
+          "description": "The size of the root volume in GB",
+          "type": "number",
+          "minimum": 1
+        },
+        "rootDeviceType": {
+          "description": "The type of the root volume",
+          "type": "string",
+          "enum": [
+            "pd-standard",
+            "pd-ssd",
+            "pd-balanced",
+            "hyperdisk-balanced"
+          ]
+        },
+        "rootDiskEncryptionKey": {
+          "type": "null"
+        },
+        "serviceAccount": {
+          "description": "The service account email and which scopes to assign to the machine",
+          "type": "object",
+          "properties": {
+            "email": {
+              "description": "Email address of the service account",
+              "type": "string"
+            },
+            "scopes": {
+              "description": "The list of scopes to be made available for this service account",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "subnet": {
+          "description": "A reference to the subnetwork to use for this instance. If not specified, the first subnetwork retrieved from the Cluster Region and Network is picked",
+          "type": "string"
+        }
+      }
+    },
+    "workersNumber": {
+      "description": "The number of the worker nodes",
+      "type": "number",
+      "minimum": 1
+    }
+  }
+}

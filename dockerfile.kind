@@ -1,0 +1,13 @@
+FROM kindest/node:v1.32.1
+
+RUN apt update && apt install wget
+RUN wget https://go.dev/dl/go1.24.4.linux-amd64.tar.gz
+RUN tar -C /usr/local -xzf go1.24.4.linux-amd64.tar.gz
+RUN export PATH=$PATH:/usr/local/go/bin && go install github.com/go-delve/delve/cmd/dlv@latest
+ADD ./exported-images /root/import
+ADD ./importkind.sh /root/importkind.sh
+ADD import.systemd /etc/systemd/system/import.service
+RUN systemctl enable import.service
+#RUN sed -e '$!N;s/enable_network_magic\n/enable_network_magic\n\/root\/importkind\.sh > \/root\/import.log\  2>\&1 \&/' /usr/local/bin/entrypoint > /usr/local/bin/entrypoint2
+#RUN mv /usr/local/bin/entrypoint2 /usr/local/bin/entrypoint
+#RUN chmod +x /usr/local/bin/entrypoint

@@ -1,0 +1,9 @@
+configSecret:
+  create: true
+  name: "gcp-variables"
+  namespace: ""
+
+config:
+  GCP_B64ENCODED_CREDENTIALS: ""
+
+manager: {}

@@ -1,0 +1,174 @@
+{{- $global := .Values.global | default dict }}
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: K0sControlPlane
+metadata:
+  name: {{ include "k0scontrolplane.name" . }}
+spec:
+  replicas: {{ .Values.controlPlaneNumber }}
+  version: {{ .Values.k0s.version }}
+  k0sConfigSpec:
+    {{- if $global.k0sURL }}
+    downloadURL: "{{ $global.k0sURL }}/k0s-{{ .Values.k0s.version }}-{{ .Values.k0s.arch }}"
+    {{- end }}
+    {{- if or $global.registryCertSecret $global.k0sURLCertSecret .Values.auth.configSecret.name }}
+    {{- $certs := dict "registry.crt" $global.registryCertSecret "k0s-url.crt" $global.k0sURLCertSecret }}
+    files:
+      {{- range $path, $secret := $certs }}
+      {{- if $secret }}
+      - contentFrom:
+          secretRef:
+            name: {{ $secret }}
+            key: ca.crt
+        permissions: "0664"
+        path: /usr/local/share/ca-certificates/{{ $path }}
+      {{- end }}
+      {{- end }}
+      {{- if .Values.auth.configSecret.name }}
+      - contentFrom:
+          secretRef:
+            name: {{ .Values.auth.configSecret.name }}
+            key: {{ default "config" .Values.auth.configSecret.key }}
+        permissions: "0644"
+        path: {{ include "authentication-config.fullpath" . }}
+      {{- end }}
+    {{- end }}
+    {{- if or $global.registryCertSecret $global.k0sURLCertSecret }}
+    preStartCommands:
+    - "sudo update-ca-certificates"
+    {{- end }}
+    args:
+      - --enable-worker
+      - --enable-cloud-provider
+      - --kubelet-extra-args="--cloud-provider=external"
+      - --disable-components=konnectivity-server
+      {{- range $arg := .Values.k0s.cpArgs }}
+      - {{ toYaml $arg }}
+      {{- end }}
+    k0s:
+      apiVersion: k0s.k0sproject.io/v1beta1
+      kind: ClusterConfig
+      metadata:
+        name: k0s
+      spec:
+        api:
+          extraArgs:
+            {{- if not .Values.auth.configWithAnon }}
+            anonymous-auth: "true"
+            {{- end }}
+            {{- if .Values.auth.configSecret.name }}
+            authentication-config: {{ include "authentication-config.fullpath" . }}
+            {{- end }}
+            {{- with .Values.k0s.api.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- with .Values.k0s.network }}
+        network: {{ toYaml . | nindent 10 }}
+        {{- end }}
+        {{- if $global.registry }}
+        images:
+          metricsserver:
+            image: "{{ $global.registry }}/metrics-server/metrics-server"
+          kubeproxy:
+            image: "{{ $global.registry }}/k0sproject/kube-proxy"
+          coredns:
+            image: "{{ $global.registry }}/k0sproject/coredns"
+          pause:
+            image: "{{ $global.registry }}/pause"
+          calico:
+            cni:
+              image: "{{ $global.registry }}/k0sproject/calico-cni"
+            node:
+              image: "{{ $global.registry }}/k0sproject/calico-node"
+            kubecontrollers:
+              image: "{{ $global.registry }}/k0sproject/calico-kube-controllers"
+        {{- end }}
+        extensions:
+          helm:
+            {{- if not $global.registry }}
+            repositories:
+              - name: mirantis
+                url: https://charts.mirantis.com
+            {{- end }}
+            charts:
+              - name: gcp-cloud-controller-manager
+                namespace: kube-system
+                {{- if $global.registry }}
+                chartname: oci://{{ $global.registry }}/charts/gcp-cloud-controller-manager
+                {{- else }}
+                chartname: mirantis/gcp-cloud-controller-manager
+                {{- end }}
+                version: "0.0.1"
+                values: |
+                  cloudConfig:
+                    enabled: true
+                    data: W0dsb2JhbF0KbXVsdGl6b25lPXRydWUK
+                  apiServer:
+                    port: 6443
+                  cloudCredentials:
+                    secretName: gcp-cloud-sa
+                    secretKey: cloud-sa.json
+                  clusterCIDR: {{ first .Values.clusterNetwork.pods.cidrBlocks }}
+                  image:
+                    {{- if $global.registry }}
+                    repository: {{ $global.registry }}/k8s-staging-cloud-provider-gcp/cloud-controller-manager
+                    {{- end }}
+                    tag: v32.2.3
+                  args:
+                    - --cloud-provider=gce
+                    - --leader-elect=true
+                    - --use-service-account-credentials=true
+                    - --allocate-node-cidrs=true
+                    - --configure-cloud-routes=false
+                    - --v=2
+              - name: gcp-compute-persistent-disk-csi-driver
+                namespace: kube-system
+                {{- if $global.registry }}
+                chartname: oci://{{ $global.registry }}/charts/gcp-compute-persistent-disk-csi-driver
+                {{- else }}
+                chartname: mirantis/gcp-compute-persistent-disk-csi-driver
+                {{- end }}
+                version: "0.0.2"
+                values: |
+                  cloudCredentials:
+                    secretName: gcp-cloud-sa
+                    secretKey: cloud-sa.json
+                  node:
+                    linux:
+                      enabled: true
+                      kubeletPath: /var/lib/k0s/kubelet
+                      {{- if $global.registry }}
+                      registrar:
+                        image:
+                          repository: {{ $global.registry }}/sig-storage/csi-node-driver-registrar
+                      driver:
+                        image:
+                          repository: {{ $global.registry }}/cloud-provider-gcp/gcp-compute-persistent-disk-csi-driver
+                      {{- end }}
+                    windows:
+                      enabled: false
+                  defaultStorageClass:
+                    enabled: true
+                  {{- if $global.registry }}
+                  controller:
+                    provisioner:
+                      image:
+                        repository: {{ $global.registry }}/sig-storage/csi-provisioner
+                    attacher:
+                      image:
+                        repository: {{ $global.registry }}/sig-storage/csi-attacher
+                    resizer:
+                      image:
+                        repository: {{ $global.registry }}/sig-storage/csi-resizer
+                    snapshotter:
+                      image:
+                        repository: {{ $global.registry }}/sig-storage/csi-snapshotter
+                    driver:
+                      image:
+                        repository: {{ $global.registry }}/cloud-provider-gcp/gcp-compute-persistent-disk-csi-driver
+                  {{- end }}
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: GCPMachineTemplate
+      name: {{ include "gcpmachinetemplate.controlplane.name" . }}
+      namespace: {{ .Release.Namespace }}

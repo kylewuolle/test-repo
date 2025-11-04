@@ -1,0 +1,40 @@
+kubeconfig
+charts/
+.DS_Store
+# Binaries for programs and plugins
+bin
+dist/
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+*.swp
+*.cover
+
+# Go workspace file
+go.work
+go.work.sum
+
+# cloud-nuke config
+*cloud-nuke.yaml
+
+# Test artifacts
+test/e2e/*.log
+support-bundle*
+**/tests/__snapshot__
+
+# editors
+.idea
+*.swp
+*.swo
+*~
+.vscode
+.vim/
+
+# Vendoring directory
+vendor/
+
+# Loadable providers
+templates/provider/kcm/files/

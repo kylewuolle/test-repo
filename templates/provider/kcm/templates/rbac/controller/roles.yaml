@@ -1,0 +1,373 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kcm.fullname" . }}-manager-role
+  labels:
+  {{- include "kcm.labels" . | nindent 4 }}
+aggregationRule:
+  clusterRoleSelectors:
+    - matchLabels:
+        k0rdent.mirantis.com/aggregate-to-manager: "true"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kcm.fullname" . }}-controller-manager-role
+  labels:
+    k0rdent.mirantis.com/aggregate-to-manager: "true"
+  {{- include "kcm.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - serviceaccounts
+  verbs:
+  - create
+  - watch
+  - get
+  - list
+  - update
+  - impersonate
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - clusterroles
+  - clusterrolebindings
+  verbs:
+  - create
+  - watch
+  - get
+  - list
+  - update
+  - bind
+  - escalate
+- apiGroups:
+  - ""
+  resources:
+  - serviceaccounts/token
+  verbs:
+  - create
+- apiGroups:
+  - operator.cluster.x-k8s.io
+  resources:
+  - coreproviders
+  - infrastructureproviders
+  - bootstrapproviders
+  - controlplaneproviders
+  - ipamproviders
+  verbs: {{ include "rbac.viewerVerbs" . | nindent 4 }}
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - clusters
+  verbs: {{ include "rbac.viewerVerbs" . | nindent 4 }}
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machinedeployments
+  verbs: {{ include "rbac.viewerVerbs" . | nindent 4 }}
+- apiGroups:
+  - helm.toolkit.fluxcd.io
+  resources:
+  - helmreleases
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - clusterdeployments
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - clusterdeployments/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - clusterdeployments/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - managements
+  - regions
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - accessmanagements
+  - clustertemplatechains
+  - servicetemplatechains
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - releases
+  verbs:
+  - get
+  - list
+  - watch
+  - patch # labels
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - releases/status
+  verbs:
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - managements/finalizers
+  - regions/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - managements/status
+  - regions/status
+  - accessmanagements/status
+  - clustertemplatechains/status
+  - servicetemplatechains/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - clustertemplates
+  - servicetemplates
+  - providertemplates
+  - statemanagementproviders
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - servicesets
+  verbs:
+  - create
+  - delete
+  - deletecollection
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - servicesets/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - clustertemplates/finalizers
+  - servicetemplates/finalizers
+  - providertemplates/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - clustertemplates/status
+  - servicetemplates/status
+  - providertemplates/status
+  - statemanagementproviders/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - source.toolkit.fluxcd.io
+  resources:
+  - helmcharts
+  - helmrepositories
+  - gitrepositories
+  - buckets
+  - ocirepositories
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - cert-manager.io
+  resources:
+  - certificaterequests
+  verbs:
+  - create
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machines
+  verbs: {{ include "rbac.viewerVerbs" . | nindent 4 }}
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - credentials
+  - clusterauthentications
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - credentials/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - credentials/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - providerinterfaces
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - providerinterfaces/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - providerinterfaces/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - lib.projectsveltos.io
+  resources:
+  - sveltosclusters
+  - sveltosclusters/status
+  verbs:
+  - get
+  - list
+  - watch
+  - patch
+- apiGroups:
+  - config.projectsveltos.io
+  resources:
+  - profiles
+  - clusterprofiles
+  - clustersummaries
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - multiclusterservices
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - multiclusterservices/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - multiclusterservices/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs: {{ include "rbac.editorVerbs" . | nindent 2 }}
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs: {{ include "rbac.editorVerbs" . | nindent 2 }}
+# managementbackups-ctrl
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - managementbackups
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - managementbackups/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - managementbackups/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - velero.io
+  resources:
+  - '*'
+  verbs:
+  - '*'
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - list
+  - watch
+  - patch
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - clusteripamclaims
+  - clusteripams
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - k0rdent.mirantis.com
+  resources:
+  - clusteripamclaims/status
+  - clusteripams/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ipam.cluster.x-k8s.io
+  resources:
+  - ipaddressclaims
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
+- apiGroups:
+  - ipam.cluster.x-k8s.io
+  resources:
+  - inclusterippools
+  verbs: {{ include "rbac.editorVerbs" . | nindent 4 }}
