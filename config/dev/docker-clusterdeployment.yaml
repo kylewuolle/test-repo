@@ -1,0 +1,11 @@
+apiVersion: k0rdent.mirantis.com/v1beta1
+kind: ClusterDeployment
+metadata:
+  name: docker-${CLUSTER_NAME_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  template: docker-hosted-cp-1-0-5
+  credential: docker-stub-credential
+  config:
+    clusterLabels: {}
+    clusterAnnotations: {}

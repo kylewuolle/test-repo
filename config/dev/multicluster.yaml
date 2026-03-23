@@ -1,0 +1,14 @@
+apiVersion: k0rdent.mirantis.com/v1beta1
+kind: MultiClusterService
+metadata:
+  name: kyle-test
+  namespace: kcm-system
+spec:
+  clusterSelector:
+    matchLabels:
+      k0rdent.mirantis.com/test-cluster-name: "aws-kyle"
+  serviceSpec:
+    services:
+      - template: ingress-nginx-4-13-0
+        name: ingress-nginx-4-13-0
+        namespace: ingress-nginx-4-13-0

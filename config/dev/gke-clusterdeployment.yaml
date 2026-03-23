@@ -1,0 +1,20 @@
+apiVersion: k0rdent.mirantis.com/v1beta1
+kind: ClusterDeployment
+metadata:
+  name: gke-${CLUSTER_NAME_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  template: gcp-gke-1-0-9
+  credential: gcp-credential
+  propagateCredentials: false
+  config:
+    clusterLabels: {}
+    releaseChannel: stable
+    # workersNumber should be divisible by the number of zones in machines.nodeLocations.
+    # If nodeLocations is not specified, must be divisible by the number of zones in this region (default: 3)
+    workersNumber: 3
+    clusterAnnotations: {}
+    project: k0rdent-dev
+    region: us-east4
+    network:
+      name: default

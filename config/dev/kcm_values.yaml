@@ -1,0 +1,24 @@
+image:
+  repository: localhost/kcm/controller
+  tag: latest
+controller:
+  defaultHelmTimeout: 20m
+  templatesRepoURL: oci://kcm-local-registry:5000/charts
+  insecureRegistry: true
+  createRelease: false
+  createTemplates: false
+  validateClusterUpgradePath: false
+  logger:
+    devel: true
+  debug:
+    pprofBindAddress: ":8082"
+regional:
+  telemetry:
+    controller:
+      image:
+        repository: localhost/kcm/telemetry
+        tag: latest
+      logger:
+        devel: true
+    mode: online
+    interval: 10m

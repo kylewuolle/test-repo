@@ -1,0 +1,21 @@
+apiVersion: k0rdent.mirantis.com/v1beta1
+kind: ClusterDeployment
+metadata:
+  name: docker-${CLUSTER_NAME_SUFFIX}
+  namespace: ${NAMESPACE}
+spec:
+  template: docker-hosted-cp-1-0-2
+  credential: docker-stub-credential
+  config:
+    clusterLabels: {}
+    clusterAnnotations: {}
+  serviceSpec:
+    # services:
+    #   - template: ingress-nginx-4-11-3
+    #     name: ingress-nginx-4-11-3
+    #     templateChain: nginx-chain
+    services:
+      - template: ingress-nginx-4-11-3
+        name: ingress-nginx
+        namespace: ingress-nginx
+        templateChain: nginx-chain
