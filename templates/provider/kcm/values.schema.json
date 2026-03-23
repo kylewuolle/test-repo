@@ -53,6 +53,8 @@
           "type": "boolean"
         },
         "debug": {
+          "title": "Debug Settings",
+          "description": "Controller's debug options",
           "type": "object",
           "properties": {
             "pprofBindAddress": {
@@ -79,6 +81,10 @@
           "type": "string"
         },
         "globalRegistry": {
+          "type": "string"
+        },
+        "imagePullSecret": {
+          "description": "Name of a Secret containing dockerconfigjson used to pull images from the registry.",
           "type": "string"
         },
         "insecureRegistry": {
@@ -137,6 +143,10 @@
             }
           }
         },
+        "maxConcurrentReconciles": {
+          "description": "Specifies the maximum number of concurrent reconciles that will be run for each controller",
+          "type": "integer"
+        },
         "nodeSelector": {
           "description": "Node selector to constrain the pod to run on specific nodes",
           "type": "object"
@@ -165,6 +175,19 @@
     "flux2": {
       "type": "object",
       "properties": {
+        "crds": {
+          "type": "object",
+          "properties": {
+            "annotations": {
+              "type": "object",
+              "properties": {
+                "helm.sh/resource-policy": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
         "enabled": {
           "type": "boolean"
         },
@@ -259,6 +282,9 @@
         }
       }
     },
+    "imagePullSecrets": {
+      "type": "array"
+    },
     "kubernetesClusterDomain": {
       "type": "string"
     },
@@ -292,6 +318,19 @@
     },
     "nameOverride": {
       "type": "string"
+    },
+    "proxy": {
+      "description": "Proxy settings",
+      "type": "object",
+      "properties": {
+        "secretName": {
+          "description": "Name of the Secret with proxy settings data",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "rbac-manager": {
       "type": "object",

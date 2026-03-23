@@ -15,23 +15,30 @@
 package serviceset
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 
+	addoncontrollerv1beta1 "github.com/projectsveltos/addon-controller/api/v1beta1"
+	libsveltosv1beta1 "github.com/projectsveltos/libsveltos/api/v1beta1"
+	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kcmv1 "github.com/K0rdent/kcm/api/v1beta1"
+	kubeutil "github.com/K0rdent/kcm/internal/util/kube"
 )
 
-// ServiceSetObjectKey generates a unique key for a ServiceSet given the input and returns it.
-func ServiceSetObjectKey(systemNamespace string, cd *kcmv1.ClusterDeployment, mcs *kcmv1.MultiClusterService) client.ObjectKey {
+// ObjectKey generates a unique key for a ServiceSet given the input and returns it.
+func ObjectKey(systemNamespace string, cd *kcmv1.ClusterDeployment, mcs *kcmv1.MultiClusterService) client.ObjectKey {
 	// We'll use the following pattern to build ServiceSet name:
 	// <ClusterDeploymentName>-<MultiClusterServiceNameHash>
 	// this will guarantee that the ServiceSet produced by MultiClusterService
@@ -88,6 +95,10 @@ func fillServiceVersions(ctx context.Context, c client.Client, namespace string,
 				version = template.Spec.Helm.ChartSpec.Version
 			}
 			svc.Version = version
+
+			if svc.Version == "" {
+				svc.Version = svc.Template
+			}
 		}
 	}
 	return nil
@@ -105,7 +116,10 @@ func fillServiceWithValueVersions(ctx context.Context, c client.Client, namespac
 			if version == "" && template.Spec.Helm != nil && template.Spec.Helm.ChartSpec != nil {
 				version = template.Spec.Helm.ChartSpec.Version
 			}
-			svc.Version = version
+			svc.Version = &version
+			if svc.Version == nil {
+				svc.Version = &svc.Template
+			}
 		}
 	}
 	return nil
@@ -148,6 +162,9 @@ func ServicesUpgradePaths(
 	services []kcmv1.Service,
 	namespace string,
 ) ([]kcmv1.ServiceUpgradePaths, error) {
+	l := ctrl.LoggerFrom(ctx)
+	l.V(1).Info("Reconciling services upgrade paths")
+
 	var errs error
 	servicesUpgradePaths := make([]kcmv1.ServiceUpgradePaths, 0, len(services))
 	for _, svc := range services {
@@ -162,6 +179,9 @@ func ServicesUpgradePaths(
 		if svc.TemplateChain == "" {
 			// Add service as an available upgrade for itself.
 			// E.g., if the service needs to be upgraded with new helm values.
+			if svc.Version == "" {
+				svc.Version = svc.Template
+			}
 			serviceUpgradePaths.AvailableUpgrades = append(serviceUpgradePaths.AvailableUpgrades, kcmv1.UpgradePath{
 				Versions: []kcmv1.AvailableUpgrade{{Name: svc.Template, Version: svc.Version}},
 			})
@@ -188,8 +208,20 @@ func ServicesUpgradePaths(
 
 // FilterServiceDependencies filters out & returns the services
 // from desired services that are NOT dependent on any other service.
-// It does so by fetching all ServiceSets associated with provided cd & mcs
-// from cd's namespace or from system namespace if cd is nil.
+// It does so by fetching all ServiceSets associated with provided
+// cd & mcs from cd's namespace or from system namespace if cd is nil.
+//
+// NOTE: This function works under the assumption that the spec
+// is correct. Meaning that it would accept A<-B as correct even
+// if A is not defined in the spec as a separate service.
+//
+// NOTE: This function works under the assumption that there will
+// always be just 1 ServiceSet for every unique combination of CD & MCS.
+//
+// NOTE: This function depends solely on the ServiceSet to fetch the latest
+// state of the services. Therefore, it works under the assumption that some
+// other mechanism like the poller for the Sveltos adapter will update the
+// ServiceSet by fetching the latest state from the specific state manager's objects.
 func FilterServiceDependencies(
 	ctx context.Context,
 	c client.Client,
@@ -231,6 +263,26 @@ func FilterServiceDependencies(
 		}
 	}
 
+	// Fetch serviceSet.
+	// We can rely on the state of the services reported in the ServiceSet because:
+	//
+	// 1. We have configured a poller in the Sveltos ServiceSet controller which
+	// polls the Sveltos ClusterSummary and triggers the ServiceSet Controller if
+	// there is a change in the state of the services.
+	//
+	// 2. The ServiceSet Controller then captures the latest state of the services
+	// from the ClusterSummary and updates the status of the relevant ServiceSet.
+	//
+	// 3. The change in the ServiceSet then triggers the ClusterDeployment or MultiClusterService
+	// controller to reconcile in which this function is called and we can then can fetch the
+	// latest state of the services directly from the relevant ServiceSet.
+	//
+	// 4. Without the poller triggering the ServiceSet controller, we would have to fetch
+	// the state of the services directly from the Sveltos ClusterSummary objects here.
+	//
+	// 5. Therefore, it is important for any state management adapter to implement a
+	// mechanism similar to the poller for the Sveltos ServiceSet controller for this
+	// function to work as intended.
 	serviceSets := new(kcmv1.ServiceSetList)
 	sel := fields.Everything()
 	if cdName != "" {
@@ -243,10 +295,38 @@ func FilterServiceDependencies(
 		return nil, fmt.Errorf("failed to list ServiceSets: %w", err)
 	}
 
+	// Map of services from the spec of fetched ServiceSets.
+	servicesFromSpec := make(map[client.ObjectKey]struct{})
+	// Map of services (with their states) from the status of fetched ServiceSets.
+	servicesFromStatus := make(map[client.ObjectKey]string)
 	for _, sset := range serviceSets.Items {
+		for _, svc := range sset.Spec.Services {
+			servicesFromSpec[ServiceKey(svc.Namespace, svc.Name)] = struct{}{}
+		}
 		for _, svc := range sset.Status.Services {
-			if svc.State == kcmv1.ServiceStateDeployed {
-				deployedServices[ServiceKey(svc.Namespace, svc.Name)] = struct{}{}
+			servicesFromStatus[ServiceKey(svc.Namespace, svc.Name)] = svc.State
+		}
+	}
+
+	// Find out which services have been successfully deployed.
+	for svc, state := range servicesFromStatus {
+		sKey := ServiceKey(svc.Namespace, svc.Name)
+		if state == kcmv1.ServiceStateDeployed {
+			deployedServices[sKey] = struct{}{}
+		} else {
+			// If state for svc is other than Deployed, then check if any of the
+			// dependents of svc already exist in the spec of the fetched ServiceSet.
+			// The mere presence of a dependent of svc in the fetched ServiceSet's spec
+			// means that the svc was indeed successfully deployed sometime in the past
+			// (even if it is currently !Deployed). Therefore, we will treat svc as deployed
+			// by adding it to the map of deployed services so that it's dependents are
+			// considered as potential services to be added to or retained in the ServiceSet's spec.
+			if deps, ok := dependents[sKey]; ok {
+				for _, d := range deps {
+					if _, ok := servicesFromSpec[d]; ok {
+						deployedServices[sKey] = struct{}{}
+					}
+				}
 			}
 		}
 	}
@@ -260,7 +340,7 @@ func FilterServiceDependencies(
 	}
 
 	// Create a new list of services to
-	// deploy having depends on count <= 0
+	// deploy having depends on count <= 0.
 	var filtered []kcmv1.Service
 	for svc, count := range dependsOnCount {
 		if count <= 0 {
@@ -269,7 +349,52 @@ func FilterServiceDependencies(
 		}
 	}
 
+	// Sort for deterministic ordering across reconcile cycles.
+	slices.SortFunc(filtered, func(a, b kcmv1.Service) int {
+		if n := cmp.Compare(effectiveNamespace(a.Namespace), effectiveNamespace(b.Namespace)); n != 0 {
+			return n
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+
 	return filtered, nil
+}
+
+func makeService(s kcmv1.Service, version, template string) kcmv1.ServiceWithValues {
+	return kcmv1.ServiceWithValues{
+		Name: s.Name,
+		// We should always use effective namespace, because service namespace in
+		// serviceSet's service definition is never empty while service namespace
+		// in clusterDeployment's/multiClusterService's service definition can be empty.
+		// This will lead to persistent discrepancy between service definitions and
+		// lead to continuous serviceSet updates.
+		Namespace:   effectiveNamespace(s.Namespace),
+		Version:     &version,
+		Template:    template,
+		Values:      s.Values,
+		ValuesFrom:  s.ValuesFrom,
+		HelmOptions: s.HelmOptions,
+		HelmAction:  s.HelmAction,
+	}
+}
+
+func appendIfNotPresent(
+	services []kcmv1.ServiceWithValues,
+	s kcmv1.Service,
+	minimumUpgrade kcmv1.AvailableUpgrade,
+) []kcmv1.ServiceWithValues {
+	serviceNamespace := effectiveNamespace(s.Namespace)
+	exists := slices.ContainsFunc(services, func(c kcmv1.ServiceWithValues) bool {
+		return c.Name == s.Name &&
+			c.Namespace == serviceNamespace &&
+			c.Version != nil &&
+			*c.Version == minimumUpgrade.Version
+	})
+
+	if !exists {
+		return append(services, makeService(s, minimumUpgrade.Version, minimumUpgrade.Name))
+	}
+	return services
 }
 
 // ServicesToDeploy returns the services to deploy based on the ClusterDeployment spec,
@@ -277,10 +402,8 @@ func FilterServiceDependencies(
 func ServicesToDeploy(
 	upgradePaths []kcmv1.ServiceUpgradePaths,
 	desiredServices []kcmv1.Service,
-	deployedServices []kcmv1.ServiceWithValues,
+	serviceSet *kcmv1.ServiceSet,
 ) []kcmv1.ServiceWithValues {
-	// todo: implement sequential version updates, taking into account observed services state
-
 	// to determine, whether service could be upgraded, we need to compute upgrade paths for
 	// desired state of services in [github.com/k0rdent/kcm/api/v1beta1.ClusterDeployment] or
 	// [github.com/k0rdent/kcm/api/v1beta1.MultiClusterService] and ensure that services can
@@ -289,41 +412,27 @@ func ServicesToDeploy(
 	desiredServiceVersions := make(map[client.ObjectKey]string)
 	desiredServiceTemplates := make(map[client.ObjectKey]string)
 	deployedServiceVersions := make(map[client.ObjectKey]string)
-	pendingOrUpgrading := make(map[client.ObjectKey]bool)
 	upgradeAvailable := make(map[client.ObjectKey]bool)
 
 	// Build desired services map
 	for _, s := range desiredServices {
 		key := client.ObjectKey{Namespace: effectiveNamespace(s.Namespace), Name: s.Name}
+		if s.Version == "" {
+			s.Version = s.Template
+		}
 		desiredServiceVersions[key] = s.Version
 		desiredServiceTemplates[key] = s.Template
 		// mark all services upgradeable by default (so new ones won't be skipped)
 		upgradeAvailable[key] = true
 	}
 
-	services := make([]kcmv1.ServiceWithValues, 0)
-
-	// Process already deployed services
-	for _, svc := range deployedServices {
-		key := client.ObjectKey{Namespace: effectiveNamespace(svc.Namespace), Name: svc.Name}
-		desiredVersion := desiredServiceVersions[key]
-
-		// check upgrade availability
-		upgradeAvailable[key] = desiredVersion < svc.Version ||
-			desiredVersionInUpgradePaths(upgradePaths, svc, desiredVersion)
-		deployedServiceVersions[key] = svc.Version
-
-		// add any services already marked as pending/upgrade
-		if (svc.Pending || svc.Upgrade) &&
-			!slices.ContainsFunc(services, func(c kcmv1.ServiceWithValues) bool {
-				return c.Name == svc.Name &&
-					c.Namespace == svc.Namespace &&
-					c.Version == svc.Version
-			}) {
-			pendingOrUpgrading[key] = true
-			services = append(services, svc)
-		}
-	}
+	services := servicesToBeUpdated(
+		serviceSet,
+		desiredServices,
+		deployedServiceVersions,
+		desiredServiceVersions,
+		upgradeAvailable,
+		upgradePaths)
 
 	// Process desired services
 	for _, s := range desiredServices {
@@ -334,18 +443,13 @@ func ServicesToDeploy(
 			continue
 		}
 
-		// skip services that are already pending/upgrade
-		if pendingOrUpgrading[key] {
-			continue
-		}
-
 		// if upgrade is not available, keep the deployed version
 		if !upgradeAvailable[key] {
-			idx := slices.IndexFunc(deployedServices, func(svc kcmv1.ServiceWithValues) bool {
+			idx := slices.IndexFunc(serviceSet.Spec.Services, func(svc kcmv1.ServiceWithValues) bool {
 				return svc.Name == s.Name && effectiveNamespace(svc.Namespace) == key.Namespace
 			})
 			if idx >= 0 {
-				services = append(services, deployedServices[idx])
+				services = append(services, makeService(s, s.Version, s.Template))
 			}
 			continue
 		}
@@ -353,53 +457,97 @@ func ServicesToDeploy(
 		desiredVersion := desiredServiceVersions[key]
 		desiredTemplate := desiredServiceTemplates[key]
 		// if no upgrade paths defined, just deploy desired version
-		if len(upgradePaths) == 0 || desiredVersion == s.Version {
-			services = append(services, kcmv1.ServiceWithValues{
-				Name:        s.Name,
-				Namespace:   s.Namespace,
-				Version:     desiredVersion,
-				Template:    desiredTemplate,
-				Values:      s.Values,
-				ValuesFrom:  s.ValuesFrom,
-				HelmOptions: s.HelmOptions,
-			})
+		if len(upgradePaths) == 0 {
+			services = append(services, makeService(s, desiredVersion, desiredTemplate))
 		}
 
 		// process upgrade paths (assume ordered lowest → highest)
 		currentVersion := deployedServiceVersions[key]
+		minimumUpgrade := kcmv1.AvailableUpgrade{}
+
 		for _, path := range upgradePaths {
 			if path.Name != s.Name {
 				continue
 			}
 
-			pending := false
 			for _, upgrade := range path.AvailableUpgrades {
 				for _, availableUpgrade := range upgrade.Versions {
-					if availableUpgrade.Version > currentVersion && availableUpgrade.Version <= desiredVersion {
-						if !slices.ContainsFunc(services, func(c kcmv1.ServiceWithValues) bool {
-							return c.Name == s.Name &&
-								c.Namespace == s.Namespace &&
-								c.Version == availableUpgrade.Version
-						}) {
-							services = append(services, kcmv1.ServiceWithValues{
-								Name:        s.Name,
-								Namespace:   s.Namespace,
-								Version:     availableUpgrade.Version,
-								Template:    availableUpgrade.Name,
-								Values:      s.Values,
-								ValuesFrom:  s.ValuesFrom,
-								HelmOptions: s.HelmOptions,
-								Pending:     pending,
-								Upgrade:     !pending,
-							})
-							pending = true
+					// Check if it's in the valid upgrade range
+					if availableUpgrade.Version >= currentVersion &&
+						availableUpgrade.Version <= desiredVersion {
+						// If we haven't found any valid upgrade yet, set it
+						if minimumUpgrade.Version == "" {
+							minimumUpgrade = availableUpgrade
+							continue
+						}
+
+						// Otherwise, see if this one is smaller than the current minimum
+						if availableUpgrade.Version < minimumUpgrade.Version {
+							minimumUpgrade = availableUpgrade
 						}
 					}
 				}
 			}
 		}
+
+		if minimumUpgrade.Version == "" {
+			minimumUpgrade = kcmv1.AvailableUpgrade{
+				Name:    s.Template,
+				Version: desiredVersion,
+			}
+		}
+
+		services = appendIfNotPresent(services, s, minimumUpgrade)
 	}
 
+	return services
+}
+
+func servicesToBeUpdated(
+	serviceSet *kcmv1.ServiceSet,
+	desiredServices []kcmv1.Service,
+	deployedServiceVersions map[client.ObjectKey]string,
+	desiredServiceVersions map[client.ObjectKey]string,
+	upgradeAvailable map[client.ObjectKey]bool,
+	upgradePaths []kcmv1.ServiceUpgradePaths,
+) []kcmv1.ServiceWithValues {
+	services := make([]kcmv1.ServiceWithValues, 0)
+
+	// we'll check whether deployed services could be upgraded to the desired version
+	for _, svc := range serviceSet.Spec.Services {
+		effectiveServiceNs := effectiveNamespace(svc.Namespace)
+		key := client.ObjectKey{Namespace: effectiveServiceNs, Name: svc.Name}
+		desiredVersion := desiredServiceVersions[key]
+		// check upgrade availability
+		upgradeAvailable[key] = svc.Version != nil && desiredVersion < *svc.Version ||
+			desiredVersionInUpgradePaths(upgradePaths, svc, desiredVersion)
+		for _, serviceState := range serviceSet.Status.Services {
+			if serviceState.State == kcmv1.ServiceStateDeployed &&
+				serviceState.Namespace == effectiveServiceNs && serviceState.Name == svc.Name && serviceState.Version != nil {
+				deployedServiceVersions[key] = *serviceState.Version
+			}
+		}
+
+		if svc.Version == nil || *svc.Version == deployedServiceVersions[key] {
+			continue
+		}
+
+		// Merge mutable fields from the desired service spec (e.g. updated values after a
+		// failed deploy) while preserving the in-flight version for upgrade-path tracking.
+		for i := 0; i < len(desiredServices); {
+			ds := desiredServices[i]
+			if ds.Name == svc.Name && effectiveNamespace(ds.Namespace) == effectiveServiceNs {
+				svc.Values = ds.Values
+				svc.ValuesFrom = ds.ValuesFrom
+				svc.HelmOptions = ds.HelmOptions
+				svc.HelmAction = ds.HelmAction
+				desiredServices = slices.Delete(desiredServices, i, i+1)
+			} else {
+				i++
+			}
+		}
+		services = append(services, svc)
+	}
 	return services
 }
 
@@ -431,115 +579,101 @@ func desiredVersionInUpgradePaths(
 }
 
 type OperationRequisites struct {
-	ObjectKey            client.ObjectKey
-	Services             []kcmv1.Service
-	ProviderSpec         kcmv1.StateManagementProviderConfig
-	PropagateCredentials bool
+	ObjectKey       client.ObjectKey
+	MCS             *kcmv1.MultiClusterService
+	CD              *kcmv1.ClusterDeployment
+	SystemNamespace string
 }
 
-// GetServiceSetWithOperation returns the ServiceSetOperation to perform and the ServiceSet object,
-// depending on the existence of the ServiceSet object and the services to deploy.
+// GetServiceSetWithOperation fetches or initialises the ServiceSet identified by
+// operationReq.ObjectKey, runs the full services pipeline, and returns the resulting
+// ServiceSet together with the operation that should be performed on it.
 func GetServiceSetWithOperation(
 	ctx context.Context,
 	c client.Client,
 	operationReq OperationRequisites,
 ) (*kcmv1.ServiceSet, kcmv1.ServiceSetOperation, error) {
 	l := ctrl.LoggerFrom(ctx)
+
+	// Determine desired services and service spec from MCS or CD.
+	var desiredServices []kcmv1.Service
+	var serviceSpec kcmv1.ServiceSpec
+	if operationReq.MCS != nil {
+		desiredServices = operationReq.MCS.Spec.ServiceSpec.Services
+		serviceSpec = operationReq.MCS.Spec.ServiceSpec
+	} else {
+		desiredServices = operationReq.CD.Spec.ServiceSpec.Services
+		serviceSpec = operationReq.CD.Spec.ServiceSpec
+	}
+
+	// Resolve the provider that backs this ServiceSet.
+	providerSpec, err := StateManagementProviderConfigFromServiceSpec(serviceSpec)
+	if err != nil {
+		return nil, kcmv1.ServiceSetOperationNone, fmt.Errorf("failed to convert ServiceSpec to provider config: %w", err)
+	}
+	provider := new(kcmv1.StateManagementProvider)
+	if err := c.Get(ctx, client.ObjectKey{Name: providerSpec.Name}, provider); err != nil {
+		return nil, kcmv1.ServiceSetOperationNone, fmt.Errorf("failed to get StateManagementProvider %s: %w", providerSpec.Name, err)
+	}
+
+	// Get ServiceSet, create if it does not exist
 	serviceSet := new(kcmv1.ServiceSet)
-	err := c.Get(ctx, operationReq.ObjectKey, serviceSet)
-	if client.IgnoreNotFound(err) != nil {
+	op := kcmv1.ServiceSetOperationUpdate
+	err = c.Get(ctx, operationReq.ObjectKey, serviceSet)
+	if apierrors.IsNotFound(err) {
+		l.V(1).Info("ServiceSet does not exist", "operation", kcmv1.ServiceSetOperationCreate)
+		serviceSet.SetName(operationReq.ObjectKey.Name)
+		serviceSet.SetNamespace(operationReq.ObjectKey.Namespace)
+		op = kcmv1.ServiceSetOperationCreate
+	} else if err != nil {
 		return nil, kcmv1.ServiceSetOperationNone, fmt.Errorf("failed to get ServiceSet %s: %w", operationReq.ObjectKey, err)
 	}
 
-	serviceSetRequired := len(operationReq.Services) > 0 || operationReq.PropagateCredentials
-	switch {
-	case err != nil:
-		if serviceSetRequired {
-			l.V(1).Info("Pending services to deploy, ServiceSet does not exist", "operation", kcmv1.ServiceSetOperationCreate)
-			serviceSet.SetName(operationReq.ObjectKey.Name)
-			serviceSet.SetNamespace(operationReq.ObjectKey.Namespace)
-			return serviceSet, kcmv1.ServiceSetOperationCreate, nil
-		}
-		l.V(1).Info("No services to deploy, ServiceSet does not exist", "operation", kcmv1.ServiceSetOperationNone)
-		return nil, kcmv1.ServiceSetOperationNone, nil
-	case !serviceSetRequired:
-		l.V(1).Info("No services to deploy, ServiceSet exists", "operation", kcmv1.ServiceSetOperationDelete)
-		return serviceSet, kcmv1.ServiceSetOperationDelete, nil
-	case needsUpdate(serviceSet, operationReq.ProviderSpec, operationReq.Services):
-		l.V(1).Info("Pending services to deploy, ServiceSet exists", "operation", kcmv1.ServiceSetOperationUpdate)
-		return serviceSet, kcmv1.ServiceSetOperationUpdate, nil
-	default:
-		l.V(1).Info("No actions required, ServiceSet exists", "operation", kcmv1.ServiceSetOperationNone)
+	templateNamespace := serviceSet.Namespace
+	upgradePaths, err := ServicesUpgradePaths(
+		ctx, c, ServicesWithDesiredChains(desiredServices, serviceSet.Spec.Services), templateNamespace)
+	if err != nil {
+		return nil, kcmv1.ServiceSetOperationNone, fmt.Errorf("failed to determine upgrade paths: %w", err)
+	}
+	l.V(1).Info("Determined upgrade paths for services", "upgradePaths", upgradePaths)
+
+	filteredServices, err := FilterServiceDependencies(
+		ctx, c, operationReq.SystemNamespace, operationReq.MCS, operationReq.CD, desiredServices)
+	if err != nil {
+		return nil, kcmv1.ServiceSetOperationNone, fmt.Errorf("failed to filter service dependencies: %w", err)
+	}
+	l.V(1).Info("Services after dependency filtering", "services", filteredServices)
+
+	if err := ResolveServiceVersions(ctx, c, templateNamespace, filteredServices); err != nil {
+		return nil, kcmv1.ServiceSetOperationNone, fmt.Errorf("failed to resolve versions for filtered services: %w", err)
+	}
+
+	serviceSetServices := serviceSet.Spec.Services
+	if err := ResolveServiceVersions(ctx, c, templateNamespace, serviceSetServices); err != nil {
+		return nil, kcmv1.ServiceSetOperationNone, fmt.Errorf("failed to resolve versions for service set services: %w", err)
+	}
+
+	resultingServices := ServicesToDeploy(upgradePaths, filteredServices, serviceSet)
+	l.V(1).Info("Services to deploy", "services", resultingServices)
+
+	// Save current spec before Build() overwrites it in place
+	// to compare spec and decide whether action is required.
+	existingSpec := serviceSet.Spec
+
+	candidate, err := NewBuilder(operationReq.CD, serviceSet, provider.Spec.Selector).
+		WithMultiClusterService(operationReq.MCS).
+		WithServicesToDeploy(resultingServices).Build()
+	if err != nil {
+		return nil, kcmv1.ServiceSetOperationNone, fmt.Errorf("failed to build ServiceSet: %w", err)
+	}
+
+	if op == kcmv1.ServiceSetOperationUpdate && equality.Semantic.DeepEqual(existingSpec, candidate.Spec) {
+		l.V(1).Info("No actions required, ServiceSet is up to date", "operation", kcmv1.ServiceSetOperationNone)
 		return serviceSet, kcmv1.ServiceSetOperationNone, nil
 	}
-}
 
-// needsUpdate checks if the ServiceSet needs to be updated based on the ClusterDeployment spec.
-// It first compares the ServiceSet's provider configuration with the ClusterDeployment's service provider configuration.
-// Then it compares the ServiceSet's observed services' state with its desired state, and after that it compares
-// the ServiceSet's observed services' state with ClusterDeployment's desired services state.
-func needsUpdate(
-	serviceSet *kcmv1.ServiceSet,
-	providerSpec kcmv1.StateManagementProviderConfig,
-	services []kcmv1.Service,
-) bool {
-	// we'll need to update provider configuration if it was changed.
-	if !equality.Semantic.DeepEqual(providerSpec, serviceSet.Spec.Provider) {
-		return true
-	}
-
-	// we'll need to compare observed services' state with desired state to ensure
-	// ServiceSet was already reconciled and services are properly deployed.
-	// we won't update ServiceSet until that.
-	observedServiceStateMap := make(map[client.ObjectKey]kcmv1.ServiceState)
-	for _, s := range serviceSet.Status.Services {
-		observedServiceStateMap[client.ObjectKey{Name: s.Name, Namespace: s.Namespace}] = kcmv1.ServiceState{
-			Name:      s.Name,
-			Namespace: s.Namespace,
-			Template:  s.Template,
-			State:     s.State,
-		}
-	}
-	desiredServiceStateMap := make(map[client.ObjectKey]kcmv1.ServiceState)
-	desiredServicesMap := make(map[client.ObjectKey]kcmv1.ServiceWithValues)
-	for _, s := range serviceSet.Spec.Services {
-		desiredServiceStateMap[client.ObjectKey{Name: s.Name, Namespace: s.Namespace}] = kcmv1.ServiceState{
-			Name:      s.Name,
-			Namespace: s.Namespace,
-			Template:  s.Template,
-			State:     kcmv1.ServiceStateDeployed,
-		}
-		desiredServicesMap[client.ObjectKey{Name: s.Name, Namespace: s.Namespace}] = kcmv1.ServiceWithValues{
-			Name:        s.Name,
-			Namespace:   s.Namespace,
-			Template:    s.Template,
-			Values:      s.Values,
-			ValuesFrom:  s.ValuesFrom,
-			HelmOptions: s.HelmOptions,
-		}
-	}
-	// difference between observed and desired services state means that ServiceSet was not fully
-	// deployed yet. Therefore we won't update ServiceSet until that.
-	if !equality.Semantic.DeepEqual(observedServiceStateMap, desiredServiceStateMap) {
-		return false
-	}
-
-	// now, since ServiceSet is fully deployed, we can compare it with ClusterDeployment's desired services state.
-	clusterDeploymentServicesMap := make(map[client.ObjectKey]kcmv1.ServiceWithValues)
-	for _, s := range services {
-		svcNamespace := effectiveNamespace(s.Namespace)
-		clusterDeploymentServicesMap[client.ObjectKey{Name: s.Name, Namespace: svcNamespace}] = kcmv1.ServiceWithValues{
-			Name:        s.Name,
-			Namespace:   svcNamespace,
-			Template:    s.Template,
-			Values:      s.Values,
-			ValuesFrom:  s.ValuesFrom,
-			HelmOptions: s.HelmOptions,
-		}
-	}
-
-	// difference between services defined in ClusterDeployment and ServiceSet means that ServiceSet needs to be updated.
-	return !equality.Semantic.DeepEqual(desiredServicesMap, clusterDeploymentServicesMap)
+	l.V(1).Info("ServiceSet requires action", "operation", op)
+	return candidate, op, nil
 }
 
 // effectiveNamespace falls back to "default" namespace in case provided service namespace is empty.
@@ -557,4 +691,67 @@ func ServiceKey(namespace, name string) client.ObjectKey {
 		Namespace: effectiveNamespace(namespace),
 		Name:      name,
 	}
+}
+
+// StateManagementProviderConfigFromServiceSpec converts ServiceSpec to StateManagementProviderConfig.
+func StateManagementProviderConfigFromServiceSpec(serviceSpec kcmv1.ServiceSpec) (kcmv1.StateManagementProviderConfig, error) {
+	type config struct {
+		SyncMode             string                                       `json:"syncMode,omitempty"`
+		TemplateResourceRefs []addoncontrollerv1beta1.TemplateResourceRef `json:"templateResourceRefs,omitempty"`
+		PolicyRefs           []addoncontrollerv1beta1.PolicyRef           `json:"policyRefs,omitempty"`
+		DriftIgnore          []libsveltosv1beta1.PatchSelector            `json:"driftIgnore,omitempty"`
+		DriftExclusions      []libsveltosv1beta1.DriftExclusion           `json:"driftExclusions,omitempty"`
+		Priority             int32                                        `json:"priority,omitempty"`
+		StopOnConflict       bool                                         `json:"stopOnConflict,omitempty"`
+		Reload               bool                                         `json:"reloader,omitempty"`
+		ContinueOnError      bool                                         `json:"continueOnError,omitempty"`
+	}
+
+	providerConfig := kcmv1.StateManagementProviderConfig{
+		SelfManagement: serviceSpec.Provider.SelfManagement,
+	}
+
+	//nolint:staticcheck // SA1019: Deprecated but used for legacy support.
+	cfg := config{
+		SyncMode:             serviceSpec.SyncMode,
+		TemplateResourceRefs: serviceSpec.TemplateResourceRefs,
+		PolicyRefs:           serviceSpec.PolicyRefs,
+		DriftIgnore:          serviceSpec.DriftIgnore,
+		DriftExclusions:      serviceSpec.DriftExclusions,
+		Priority:             serviceSpec.Priority,
+		StopOnConflict:       serviceSpec.StopOnConflict,
+		Reload:               serviceSpec.Reload,
+		ContinueOnError:      serviceSpec.ContinueOnError,
+	}
+
+	switch {
+	// if neither provider name nor config is set, we'll use the
+	// default provider and config defined in deprecated fields
+	case serviceSpec.Provider.Name == "" && serviceSpec.Provider.Config == nil:
+		providerConfig.Name = kubeutil.DefaultStateManagementProvider
+		raw, err := json.Marshal(cfg)
+		if err != nil {
+			return kcmv1.StateManagementProviderConfig{}, fmt.Errorf("failed to marshal config: %w", err)
+		}
+		providerConfig.Config = &apiextv1.JSON{Raw: raw}
+
+	// if provider name is not set, but config is defined, we'll
+	// use the default provider name and defined configuration
+	case serviceSpec.Provider.Name == "" && serviceSpec.Provider.Config != nil:
+		providerConfig.Name = kubeutil.DefaultStateManagementProvider
+		providerConfig.Config = serviceSpec.Provider.Config.DeepCopy()
+
+	// if provider name is set, but config is not defined, we'll
+	// use the defined provider name and config falling back to default provider values
+	// no-op
+	case serviceSpec.Provider.Name != "" && serviceSpec.Provider.Config == nil:
+		providerConfig.Name = serviceSpec.Provider.Name
+
+	// if both provider name and config are set, we'll use the defined provider name and config
+	// no-op
+	case serviceSpec.Provider.Name != "" && serviceSpec.Provider.Config != nil:
+		providerConfig = serviceSpec.Provider
+		providerConfig.Config = serviceSpec.Provider.Config.DeepCopy()
+	}
+	return providerConfig, nil
 }

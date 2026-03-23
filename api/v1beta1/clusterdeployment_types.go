@@ -50,9 +50,13 @@ const (
 	SveltosClusterReadyCondition = "SveltosClusterReady"
 	// CloudResourcesDeletedCondition indicates whether the cloud resources have been deleted.
 	CloudResourcesDeletedCondition = "CloudResourcesDeletedCondition"
-	// ClusterAuthenticationReadyCondition indicates whether the referenced ClusterAuthentication object exists
+	// ClusterAuthenticationReadyCondition indicates whether the referenced [ClusterAuthentication] object exists
 	// and ready.
 	ClusterAuthenticationReadyCondition = "ClusterAuthenticationReady"
+	// DataSourceReadyCondition indicates whether the referenced [DataSource] object exists and ready.
+	DataSourceReadyCondition = "DataSourceReady"
+	// ClusterDataSourceReadyCondition indicates whether the dedicated [ClusterDataSource] object exists and its data is ready to be used.
+	ClusterDataSourceReadyCondition = "ClusterDataSourceReady"
 )
 
 // ClusterDeploymentSpec defines the desired state of ClusterDeployment
@@ -67,10 +71,12 @@ type ClusterDeploymentSpec struct {
 
 	// Template is a reference to a Template object located in the same namespace.
 	Template string `json:"template"`
-	// Name reference to the related Credentials object.
+	// Name reference to the related [Credential] object located in the same namespace.
 	Credential string `json:"credential,omitempty"`
-	// Name reference to the related ClusterAuthentication object.
+	// Name reference to the related [ClusterAuthentication] object.
 	ClusterAuth string `json:"clusterAuth,omitempty"`
+	// DataSource is the name reference to the related [DataSource] object located in the same namespace.
+	DataSource string `json:"dataSource,omitempty"`
 	// IPAMClaim defines IP Address Management (IPAM) requirements for the cluster.
 	// It can either reference an existing IPAM claim or specify an inline claim.
 	IPAMClaim ClusterIPAMClaimType `json:"ipamClaim,omitempty"`
@@ -147,7 +153,7 @@ type ClusterDeployment struct { //nolint:govet // false-positive
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   ClusterDeploymentSpec   `json:"spec,omitempty"`
+	Spec   ClusterDeploymentSpec   `json:"spec"`
 	Status ClusterDeploymentStatus `json:"status,omitempty"`
 }
 

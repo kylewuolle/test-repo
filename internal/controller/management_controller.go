@@ -62,6 +62,7 @@ type ManagementReconciler struct {
 	GlobalK0sURL           string
 	K0sURLCertSecretName   string // Name of a Secret with K0s Download URL Root CA with ca.crt key; to be passed to the ClusterDeploymentReconciler
 	RegistryCertSecretName string // Name of a Secret with Registry Root CA with ca.crt key; used by ManagementReconciler and ClusterDeploymentReconciler
+	ImagePullSecretName    string
 
 	DefaultHelmTimeout time.Duration
 	defaultRequeueTime time.Duration
@@ -113,7 +114,7 @@ func (r *ManagementReconciler) update(ctx context.Context, management *kcmv1.Man
 		return ctrl.Result{}, err
 	}
 
-	if changed, err := kubeutil.SetPredeclaredSecretsCondition(ctx, r.Client, management, record.Warnf, r.SystemNamespace, r.RegistryCertSecretName); err != nil { // if changed and NO error we will eventually update the status
+	if changed, err := kubeutil.SetPredeclaredSecretsCondition(ctx, r.Client, management, r.SystemNamespace, r.RegistryCertSecretName); err != nil { // if changed and NO error we will eventually update the status
 		l.Error(err, "failed to check if given Secrets exist")
 		if changed {
 			return ctrl.Result{}, r.updateStatus(ctx, management)
@@ -178,12 +179,15 @@ func (r *ManagementReconciler) update(ctx context.Context, management *kcmv1.Man
 		Namespace:              r.SystemNamespace,
 		GlobalRegistry:         r.GlobalRegistry,
 		RegistryCertSecretName: r.RegistryCertSecretName,
+		ImagePullSecretName:    r.ImagePullSecretName,
 	}
 
 	requeue, errs := components.Reconcile(ctx, r.Client, r.Client, management, r.Config, release, opts)
-
+	if errs == nil { // if NO error
+		// update only if we actually observed the new release
+		management.Status.Release = management.Spec.Release
+	}
 	management.Status.ObservedGeneration = management.Generation
-	management.Status.Release = management.Spec.Release
 
 	shouldRequeue, err := r.startDependentControllers(ctx, management)
 	if err != nil {
@@ -196,12 +200,15 @@ func (r *ManagementReconciler) update(ctx context.Context, management *kcmv1.Man
 
 	r.setReadyCondition(management)
 
+	// we still want to update the status with the currently observed condition
 	errs = errors.Join(errs, r.updateStatus(ctx, management))
 	if errs != nil {
 		l.Error(errs, "Multiple errors during Management reconciliation")
 		return ctrl.Result{}, errs
 	}
+
 	if requeue {
+		l.V(1).Info("Requeuing the object as requested", "requeue after", r.defaultRequeueTime)
 		return ctrl.Result{RequeueAfter: r.defaultRequeueTime}, nil
 	}
 
@@ -237,7 +244,7 @@ func (r *ManagementReconciler) validateManagement(ctx context.Context, managemen
 	}
 
 	l.V(1).Info("Validating providers CAPI contracts compatibility")
-	incompContracts, err := validationutil.GetIncompatibleContracts(ctx, r.Client, release, management)
+	incompContracts, err := validationutil.ValidateProviderContracts(ctx, r.Client, release, management)
 	if len(incompContracts) == 0 && err == nil { // if NO error
 		return true, nil
 	}
@@ -625,13 +632,6 @@ func (r *ManagementReconciler) updateStatus(ctx context.Context, mgmt *kcmv1.Man
 // setReadyCondition updates the Management resource's "Ready" condition based on whether
 // all components are healthy.
 func (r *ManagementReconciler) setReadyCondition(management *kcmv1.Management) {
-	var failing []string
-	for name, comp := range management.Status.Components {
-		if !comp.Success {
-			failing = append(failing, name)
-		}
-	}
-
 	readyCond := metav1.Condition{
 		Type:               kcmv1.ReadyCondition,
 		ObservedGeneration: management.Generation,
@@ -639,12 +639,29 @@ func (r *ManagementReconciler) setReadyCondition(management *kcmv1.Management) {
 		Reason:             kcmv1.AllComponentsHealthyReason,
 		Message:            "All components are successfully installed",
 	}
-	sort.Strings(failing)
-	if len(failing) > 0 {
+
+	if management.Status.Release != management.Spec.Release {
+		// we set the new release only if there were no errors, so if the observed state does not equal
+		// the desired state, then we assume the object is not yet ready
 		readyCond.Status = metav1.ConditionFalse
-		readyCond.Reason = kcmv1.NotAllComponentsHealthyReason
-		readyCond.Message = fmt.Sprintf("Components not ready: %v", failing)
+		readyCond.Reason = kcmv1.ReleaseIsNotObserved
+		readyCond.Message = fmt.Sprintf("Release %s is not yet observed", management.Spec.Release)
+	} else {
+		var failing []string
+		for name, comp := range management.Status.Components {
+			if !comp.Success {
+				failing = append(failing, name)
+			}
+		}
+
+		sort.Strings(failing)
+		if len(failing) > 0 {
+			readyCond.Status = metav1.ConditionFalse
+			readyCond.Reason = kcmv1.NotAllComponentsHealthyReason
+			readyCond.Message = fmt.Sprintf("Components not ready: %v", failing)
+		}
 	}
+
 	if meta.SetStatusCondition(&management.Status.Conditions, readyCond) && readyCond.Status == metav1.ConditionTrue {
 		r.eventf(management, "ManagementIsReady", "Management KCM components are ready")
 	}
@@ -723,10 +740,12 @@ func (r *ManagementReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return managedController.Complete(r)
 }
 
+// TODO: FIXME: pass meaningful non-empty action
 func (*ManagementReconciler) eventf(mgmt *kcmv1.Management, reason, message string, args ...any) {
-	record.Eventf(mgmt, mgmt.Generation, reason, message, args...)
+	record.Eventf(mgmt, nil, reason, "Reconcile", message, args...)
 }
 
+// TODO: FIXME: pass meaningful non-empty action
 func (*ManagementReconciler) warnf(mgmt *kcmv1.Management, reason, message string, args ...any) {
-	record.Warnf(mgmt, mgmt.Generation, reason, message, args...)
+	record.Warnf(mgmt, nil, reason, "Reconcile", message, args...)
 }

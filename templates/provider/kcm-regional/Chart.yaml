@@ -13,17 +13,21 @@ type: application
 # This is the chart version. This version number should be incremented each time you make changes
 # to the chart and its templates, including the app version.
 # Versions are expected to follow Semantic Versioning (https://semver.org/)
-version: 1.0.5
+version: 1.8.0
 dependencies:
   - name: cert-manager
-    version: 1.19.1
+    version: 1.19.4
     repository: https://charts.jetstack.io
     condition: cert-manager.enabled
   - name: cluster-api-operator
-    version: 0.24.0
+    version: 0.26.0
     repository: https://kubernetes-sigs.github.io/cluster-api-operator
     condition: cluster-api-operator.enabled
   - name: velero
-    version: 11.0.0
+    version: 11.4.0
     repository: https://vmware-tanzu.github.io/helm-charts
     condition: velero.enabled
+  - name: reloader
+    version: 2.2.8
+    repository: https://stakater.github.io/stakater-charts
+    condition: reloader.enabled

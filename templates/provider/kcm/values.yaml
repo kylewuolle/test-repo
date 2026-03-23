@@ -6,6 +6,9 @@ admissionWebhook:
   port: 9443
   certDir: "/tmp/k8s-webhook-server/serving-certs/"
 
+proxy: # @schema description: Proxy settings; type: object
+  secretName: "" # @schema description: Name of the Secret with proxy settings data; type: [string, null]
+
 controller:
   templatesRepoURL: "oci://ghcr.io/k0rdent/kcm/charts"
   globalRegistry: ""
@@ -13,6 +16,7 @@ controller:
   k0sURLCertSecret: "" # @schema type: string; description: Name of a Secret containing K0s Download URL Root CA with ca.crt key
   registryCredsSecret: "" # @schema type: string; description: Name of a Secret containing Registry Credentials (Auth) Data
   registryCertSecret: "" # @schema type: string; description: Name of a Secret containing Registry Root CA with ca.crt key
+  imagePullSecret: "" # @schema type: string; description: Name of a Secret containing dockerconfigjson used to pull images from the registry.
   insecureRegistry: false
   createManagement: true
   createAccessManagement: true
@@ -25,13 +29,14 @@ controller:
   enableSveltosCtrl: true # @schema type: boolean; description: Enables built-in ServiceSet controller to reconcile ProjectSveltos objects
   enableSveltosExpiredCtrl: false # @schema type: boolean; description: Enables SveltosCluster controller, updating stuck (expired) sveltos management cluster kubeconfig tokens
   defaultHelmTimeout: "" # @schema type: string; description: Specifies the timeout duration for Helm install or upgrade operations. If unset, Flux’s default value will be used
+  maxConcurrentReconciles: 10 # @schema type: integer; description: Specifies the maximum number of concurrent reconciles that will be run for each controller
   logger: # @schema title: Logger Settings; description: Global controllers logger settings; type: object
     devel: false # @schema type: boolean; description: Development defaults(encoder=console,logLevel=debug,stackTraceLevel=warn) Production defaults(encoder=json,logLevel=info,stackTraceLevel=error)
     encoder: "" # @schema enum:[json, console, ""] ; type: string
     log-level: "" # @schema enum:[info, debug, error, ""] ; type: string
     stacktrace-level: "" # @schema enum:[info, error, panic, ""] ; type: string
     time-encoding: rfc3339 # @schema enum:[epoch, millis, nano, iso8601, rfc3339, rfc3339nano, ""] ; type: string
-  debug:
+  debug: # @schema title: Debug Settings; description: Controller's debug options; type: object
     pprofBindAddress: "" # @schema type: string; title: Set pprof binding address; description: The TCP address that the controller should bind to for serving pprof, '0' or empty value disables pprof; pattern: (?:^0?$)|(?:^(?:[\w.-]+(?:\.?[\w\.-]+)+)?:(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$)
 
 containerSecurityContext:
@@ -47,11 +52,11 @@ image:
 
 resources:
   limits:
+    cpu: "1"
+    memory: 256Mi
+  requests:
     cpu: 500m
     memory: 128Mi
-  requests:
-    cpu: 10m
-    memory: 64Mi
 
 replicas: 1
 
@@ -66,6 +71,8 @@ metricsService:
       protocol: TCP
       targetPort: 8080
   type: ClusterIP
+
+imagePullSecrets: []
 
 # Subcharts
 flux2:
@@ -88,6 +95,9 @@ flux2:
     container:
       additionalArgs:
         - --watch-label-selector=k0rdent.mirantis.com/managed=true
+  crds:
+    annotations:
+      "helm.sh/resource-policy": "keep"
 
 rbac-manager:
   enabled: true

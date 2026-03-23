@@ -132,10 +132,6 @@ func bucketOperatorInstalled(typ string, v bool) string {
 	return "gpu.operator_installed." + typ + ":" + strconv.FormatBool(v)
 }
 
-func bucketSyncMode(mode string) string {
-	return "syncMode:" + strings.ToLower(mode)
-}
-
 func bucketTemplate(name string) string {
 	return "template:" + name
 }
@@ -221,7 +217,7 @@ func generateBounds(first, factor, cut uint64) []uint64 {
 	if first < 1 {
 		first = 1
 	}
-	var b []uint64 //nolint:prealloc // no need
+	var b []uint64
 	for x := first; x <= cut; x *= factor {
 		b = append(b, x)
 		if x > cut/factor { // overflow

@@ -1,3 +1,4 @@
+{{- $global := .Values.global | default dict }}
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -12,6 +13,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.1
+    helm.sh/resource-policy: keep
   name: flavors.openstack.k-orc.cloud
 spec:
   group: openstack.k-orc.cloud
@@ -385,6 +387,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.1
+    helm.sh/resource-policy: keep
   name: images.openstack.k-orc.cloud
 spec:
   group: openstack.k-orc.cloud
@@ -1112,6 +1115,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.1
+    helm.sh/resource-policy: keep
   name: networks.openstack.k-orc.cloud
 spec:
   group: openstack.k-orc.cloud
@@ -1639,6 +1643,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.1
+    helm.sh/resource-policy: keep
   name: ports.openstack.k-orc.cloud
 spec:
   group: openstack.k-orc.cloud
@@ -2227,6 +2232,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.1
+    helm.sh/resource-policy: keep
   name: projects.openstack.k-orc.cloud
 spec:
   group: openstack.k-orc.cloud
@@ -2580,6 +2586,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.1
+    helm.sh/resource-policy: keep
   name: routerinterfaces.openstack.k-orc.cloud
 spec:
   group: openstack.k-orc.cloud
@@ -2749,6 +2756,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.1
+    helm.sh/resource-policy: keep
   name: routers.openstack.k-orc.cloud
 spec:
   group: openstack.k-orc.cloud
@@ -3190,6 +3198,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.1
+    helm.sh/resource-policy: keep
   name: securitygroups.openstack.k-orc.cloud
 spec:
   group: openstack.k-orc.cloud
@@ -3777,6 +3786,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.1
+    helm.sh/resource-policy: keep
   name: servers.openstack.k-orc.cloud
 spec:
   group: openstack.k-orc.cloud
@@ -4178,6 +4188,7 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.17.1
+    helm.sh/resource-policy: keep
   name: subnets.openstack.k-orc.cloud
 spec:
   group: openstack.k-orc.cloud
@@ -5117,7 +5128,7 @@ spec:
         - --health-probe-bind-address=:8081
         command:
         - /manager
-        image: {{ default "quay.io" (and .Values.global .Values.global.registry) }}/orc/openstack-resource-controller:v2.1.0
+        image: {{ default "quay.io" $global.registry }}/orc/openstack-resource-controller:v2.1.0
         livenessProbe:
           httpGet:
             path: /healthz
@@ -5125,6 +5136,11 @@ spec:
           initialDelaySeconds: 15
           periodSeconds: 20
         name: manager
+        {{- $proxyEnv := include "infrastructureProvider.proxyEnv" . | fromYaml }}
+        {{- if $proxyEnv }}
+        env:
+        {{ toYaml $proxyEnv.env | nindent 8 }}
+        {{- end }}
         readinessProbe:
           httpGet:
             path: /readyz
@@ -5152,4 +5168,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: orc-controller-manager
+      {{- if $global.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml $global.imagePullSecrets | nindent 8 }}
+      {{- end }}
       terminationGracePeriodSeconds: 10

@@ -17,25 +17,30 @@ package multiclusterservice
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kcmv1 "github.com/K0rdent/kcm/api/v1beta1"
+	"github.com/K0rdent/kcm/internal/serviceset"
 	statusutil "github.com/K0rdent/kcm/internal/util/status"
 	"github.com/K0rdent/kcm/test/e2e/kubeclient"
 	"github.com/K0rdent/kcm/test/e2e/logs"
+	servicesete2e "github.com/K0rdent/kcm/test/e2e/serviceset"
 	validationutil "github.com/K0rdent/kcm/test/util/validation"
 )
 
 // BuildMultiClusterService constructs a MultiClusterService spec for the given ClusterDeployment.
 func BuildMultiClusterService(cd *kcmv1.ClusterDeployment, multiClusterServiceTemplate, multiClusterServiceMatchLabel, name string) *kcmv1.MultiClusterService {
 	return &kcmv1.MultiClusterService{
-		TypeMeta: metav1.TypeMeta{},
+		TypeMeta: metav1.TypeMeta{
+			Kind: kcmv1.MultiClusterServiceKind,
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: cd.Namespace,
@@ -60,54 +65,158 @@ func BuildMultiClusterService(cd *kcmv1.ClusterDeployment, multiClusterServiceTe
 	}
 }
 
-func CreateMultiClusterService(ctx context.Context, cl crclient.Client, mc *kcmv1.MultiClusterService) {
+func CreateMultiClusterService(ctx context.Context, cl client.Client, mcs *kcmv1.MultiClusterService) {
+	Expect(mcs).NotTo(BeNil())
+	Expect(mcs.Kind).To(Equal(kcmv1.MultiClusterServiceKind))
+
 	Eventually(func() error {
-		err := crclient.IgnoreAlreadyExists(cl.Create(ctx, mc))
+		err := client.IgnoreAlreadyExists(cl.Create(ctx, mcs))
 		if err != nil {
-			logs.Println("failed to create MultiClusterService: " + err.Error())
+			logs.WarnErrorf(err, "failed to create MultiClusterService")
+		}
+		return err
+	}).WithTimeout(1 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+	logs.Printf("Created MultiClusterService %s", client.ObjectKeyFromObject(mcs))
+}
+
+func CreateMultiClusterServiceWithDelete(
+	ctx context.Context,
+	cl client.Client,
+	mcs *kcmv1.MultiClusterService,
+) func() error {
+	CreateMultiClusterService(ctx, cl, mcs)
+	mcsKey := client.ObjectKeyFromObject(mcs)
+	return func() error {
+		logs.Printf("Deleting MultiClusterService [%s]", mcsKey)
+
+		if err := cl.Delete(ctx, mcs); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+
+		Eventually(func() bool {
+			err := cl.Get(ctx, mcsKey, &kcmv1.MultiClusterService{})
+			return apierrors.IsNotFound(err)
+		}).WithTimeout(5 * time.Minute).WithPolling(3 * time.Second).Should(BeTrue())
+
+		logs.Printf("Deleted MultiClusterService [%s]", mcsKey)
+
+		return nil
+	}
+}
+
+func DeleteMultiClusterService(ctx context.Context, cl client.Client, mc *kcmv1.MultiClusterService) {
+	Eventually(func() error {
+		err := client.IgnoreNotFound(cl.Delete(ctx, mc))
+		if err != nil {
+			logs.WarnErrorf(err, "failed to delete MultiClusterService")
 		}
 		return err
 	}, 1*time.Minute, 10*time.Second).Should(Succeed())
 }
 
-func DeleteMultiClusterService(ctx context.Context, cl crclient.Client, mc *kcmv1.MultiClusterService) {
-	Eventually(func() error {
-		err := crclient.IgnoreNotFound(cl.Delete(ctx, mc))
-		if err != nil {
-			logs.Println("failed to delete MultiClusterService: " + err.Error())
-		}
-		return err
-	}, 1*time.Minute, 10*time.Second).Should(Succeed())
-}
-
-func checkMultiClusterServiceConditions(ctx context.Context, kc *kubeclient.KubeClient, multiclusterServiceName string, expectedCount int) error {
-	multiclusterService, err := kc.GetMultiClusterService(ctx, multiclusterServiceName)
-	if err != nil {
-		return err
+func checkClusterReadyConditionInMCS(mcsName string, expectedCount int, conditions []metav1.Condition) (err error) {
+	var found bool
+	if expectedCount == 0 {
+		return nil
 	}
+	expected := strconv.Itoa(expectedCount) + "/" + strconv.Itoa(expectedCount)
 
-	conditions, err := statusutil.ConditionsFromUnstructured(multiclusterService)
-	if err != nil {
-		return err
-	}
-	objKind, objName := statusutil.ObjKindName(multiclusterService)
-	for _, c := range conditions {
-		if c.Type == kcmv1.ClusterInReadyStateCondition {
-			if !strings.Contains(c.Message, fmt.Sprintf("%d/%d", expectedCount, expectedCount)) {
-				return fmt.Errorf("%s %s is not ready with conditions:\n%s", objKind, objName, validationutil.ConvertConditionsToString(c))
+	for _, cond := range conditions {
+		if cond.Type == kcmv1.ClusterInReadyStateCondition {
+			found = true
+			if !strings.Contains(cond.Message, expected) {
+				err = fmt.Errorf("expected '%s' in message for condition %s for MCS %s but actual message is '%s'", expected, kcmv1.ClusterInReadyStateCondition, mcsName, cond.Message)
 			}
 		}
 	}
-	return validationutil.ValidateConditionsTrue(multiclusterService)
+	if !found {
+		return fmt.Errorf("condition %s not found in MCS %s", kcmv1.ClusterInReadyStateCondition, mcsName)
+	}
+
+	return err
 }
 
 // ValidateMultiClusterService wraps the Eventually check for validation.
-func ValidateMultiClusterService(kc *kubeclient.KubeClient, name string, expectedCount int) {
-	Eventually(func() error {
-		err := checkMultiClusterServiceConditions(context.Background(), kc, name, expectedCount)
+func ValidateMultiClusterService(ctx context.Context, kc *kubeclient.KubeClient, name string, expectedCount int) {
+	Eventually(func() (err error) {
+		defer func() {
+			if err != nil {
+				logs.WarnErrorf(err, "failed to validate MCS %s", name)
+			}
+		}()
+
+		mcs, err := kc.GetMultiClusterService(ctx, name)
 		if err != nil {
-			_, _ = fmt.Fprintf(GinkgoWriter, "[%s] validation error: %v\n", name, err)
+			return err
 		}
-		return err
+
+		conditions, err := statusutil.ConditionsFromUnstructured(mcs)
+		if err != nil {
+			return err
+		}
+
+		if err = checkClusterReadyConditionInMCS(name, expectedCount, conditions); err != nil {
+			return err
+		}
+
+		return validationutil.ValidateConditionsTrue(mcs)
 	}).WithTimeout(10 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+}
+
+func GetMultiClusterService(ctx context.Context, cl client.Client, key client.ObjectKey) (*kcmv1.MultiClusterService, error) {
+	mcs := &kcmv1.MultiClusterService{}
+	if err := cl.Get(ctx, key, mcs); err != nil {
+		return nil, err
+	}
+	return mcs, nil
+}
+
+// ValidateMCSConditions validates that the provided list of expected conditions
+// eventually exist in the status of the MCS object represented by the provided key.
+func ValidateMCSConditions(ctx context.Context, cl client.Client, mcsKey client.ObjectKey, expectedConditions []metav1.Condition) {
+	Eventually(func() (err error) {
+		defer func() {
+			if err != nil {
+				logs.WarnErrorf(err, "failed validation of conditions MCS %s", mcsKey)
+			}
+		}()
+
+		mcs, err := GetMultiClusterService(ctx, cl, mcsKey)
+		if err != nil {
+			return err
+		}
+
+		conditionsMap := make(map[string]metav1.Condition, len(expectedConditions))
+		for _, cond := range mcs.Status.Conditions {
+			conditionsMap[cond.Type] = cond
+		}
+
+		for _, expectedCond := range expectedConditions {
+			actualCond, ok := conditionsMap[expectedCond.Type]
+			if !ok {
+				return fmt.Errorf("expected condition %s to exist but did not exist in actual", expectedCond.Type)
+			}
+
+			if expectedCond.Status != "" && actualCond.Status != expectedCond.Status {
+				return fmt.Errorf("condition %s failed: actual status %q != expected status %q", actualCond.Type, actualCond.Status, expectedCond.Status)
+			}
+			if expectedCond.Message != "" && actualCond.Message != expectedCond.Message {
+				return fmt.Errorf("condition %s failed: actual message %q != expected message %q", actualCond.Type, actualCond.Message, expectedCond.Message)
+			}
+		}
+
+		return nil
+	}).WithTimeout(5 * time.Minute).WithPolling(3 * time.Second).Should(Succeed())
+
+	logs.Printf("[%s] MultiClusterService successfully passed", mcsKey)
+}
+
+// ValidateServiceSet validates the ServiceSet associated with the provided CD and MCS.
+func ValidateServiceSet(ctx context.Context, cl client.Client, systemNamespace string, cd *kcmv1.ClusterDeployment, mcs *kcmv1.MultiClusterService) {
+	serviceSetKey := serviceset.ObjectKey(systemNamespace, cd, mcs)
+	services := make([]client.ObjectKey, len(mcs.Spec.ServiceSpec.Services))
+	for i, svc := range mcs.Spec.ServiceSpec.Services {
+		services[i] = client.ObjectKey{Namespace: svc.Namespace, Name: svc.Name}
+	}
+	servicesete2e.ValidateServiceSet(ctx, cl, serviceSetKey, services)
 }
