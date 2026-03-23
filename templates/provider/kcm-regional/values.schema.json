@@ -11,9 +11,6 @@
           "properties": {
             "enabled": {
               "type": "boolean"
-            },
-            "keep": {
-              "type": "boolean"
             }
           }
         },
@@ -65,8 +62,30 @@
     "fullnameOverride": {
       "type": "string"
     },
+    "imagePullSecrets": {
+      "type": "array"
+    },
     "nameOverride": {
       "type": "string"
+    },
+    "reloader": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "reloader": {
+          "type": "object",
+          "properties": {
+            "ignoreCronJobs": {
+              "type": "boolean"
+            },
+            "ignoreJobs": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
     },
     "telemetry": {
       "description": "Telemetry collection configuration",
@@ -87,6 +106,8 @@
               "type": "object"
             },
             "debug": {
+              "title": "Debug Settings",
+              "description": "Controller's debug options",
               "type": "object",
               "properties": {
                 "pprofBindAddress": {
@@ -100,6 +121,17 @@
             "image": {
               "type": "object",
               "properties": {
+                "initContainer": {
+                  "type": "object",
+                  "properties": {
+                    "repository": {
+                      "type": "string"
+                    },
+                    "tag": {
+                      "type": "string"
+                    }
+                  }
+                },
                 "pullPolicy": {
                   "description": "Image pull policy",
                   "type": "string",
@@ -170,6 +202,17 @@
               "description": "Node selector to constrain the pod to run on specific nodes",
               "type": "object"
             },
+            "proxy": {
+              "description": "Controller proxy settings",
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "description": "Enable proxy",
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": false
+            },
             "replicas": {
               "type": "integer"
             },
@@ -206,6 +249,14 @@
             }
           },
           "additionalProperties": false
+        },
+        "extraCEL": {
+          "description": "CEL expression to be executed if the .telemetry.extraResource field has been provided",
+          "type": "string"
+        },
+        "extraResource": {
+          "description": "List objects of this resource to apply the CEL expression on it. Adds extra properties to the data collected, applicable only for the online mode",
+          "type": "string"
         },
         "interval": {
           "description": "Defines how frequently the data should be collected",

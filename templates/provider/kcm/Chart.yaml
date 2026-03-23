@@ -13,17 +13,17 @@ type: application
 # This is the chart version. This version number should be incremented each time you make changes
 # to the chart and its templates, including the app version.
 # Versions are expected to follow Semantic Versioning (https://semver.org/)
-version: 1.5.0
+version: 1.8.0
 dependencies:
   - name: flux2
-    version: 2.16.4
+    version: 2.17.2
     repository: https://fluxcd-community.github.io/helm-charts
     condition: flux2.enabled
   - name: rbac-manager
-    version: 1.21.2
+    version: 1.21.5
     repository: https://charts.fairwinds.com/stable
     condition: rbac-manager.enabled
   - name: kcm-regional
     alias: regional
-    version: 1.0.5
+    version: 1.8.0
     repository: "file://../kcm-regional"

@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"time"
 
@@ -30,8 +29,6 @@ import (
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chartutil"
 	"helm.sh/helm/v3/pkg/storage/driver"
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -39,7 +36,6 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
-	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -56,7 +52,6 @@ import (
 	"github.com/K0rdent/kcm/internal/record"
 	kubeutil "github.com/K0rdent/kcm/internal/util/kube"
 	labelsutil "github.com/K0rdent/kcm/internal/util/labels"
-	pointerutil "github.com/K0rdent/kcm/internal/util/pointer"
 	ratelimitutil "github.com/K0rdent/kcm/internal/util/ratelimit"
 	releaseutil "github.com/K0rdent/kcm/internal/util/release"
 )
@@ -77,6 +72,7 @@ type ReleaseReconciler struct {
 	CreateManagement bool
 	CreateRelease    bool
 	CreateTemplates  bool
+	FluxEnabled      bool
 }
 
 func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
@@ -139,7 +135,7 @@ func (r *ReleaseReconciler) Reconcile(ctx context.Context, req ctrl.Request) (re
 	if release.Name == "" {
 		if err := r.ensureManagement(ctx); err != nil {
 			l.Error(err, "failed to create Management object")
-			r.eventf(release, "ManagementCreationFailed", err.Error())
+			record.Eventf(release, &kcmv1.Management{}, "ManagementCreationFailed", "CreateManagement", err.Error())
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -175,7 +171,7 @@ func (r *ReleaseReconciler) validateProviderTemplates(ctx context.Context, relea
 	return nil
 }
 
-func (r *ReleaseReconciler) updateTemplatesValidCondition(release *kcmv1.Release, err error) (changed bool) {
+func (*ReleaseReconciler) updateTemplatesValidCondition(release *kcmv1.Release, err error) (changed bool) {
 	condition := metav1.Condition{
 		Type:               kcmv1.TemplatesValidCondition,
 		Status:             metav1.ConditionTrue,
@@ -192,7 +188,7 @@ func (r *ReleaseReconciler) updateTemplatesValidCondition(release *kcmv1.Release
 
 	changed = meta.SetStatusCondition(&release.Status.Conditions, condition)
 	if changed && err != nil {
-		r.warnf(release, "InvalidProviderTemplates", err.Error())
+		record.Warnf(release, nil, "InvalidProviderTemplates", "ValidateTemplates", err.Error())
 	}
 
 	return changed
@@ -217,7 +213,7 @@ func (r *ReleaseReconciler) updateTemplatesCreatedCondition(release *kcmv1.Relea
 
 	changed = meta.SetStatusCondition(&release.Status.Conditions, condition)
 	if changed && err != nil {
-		r.warnf(release, "TemplatesCreationFailed", err.Error())
+		record.Warnf(release, nil, "TemplatesCreationFailed", "CreateTemplates", err.Error())
 	}
 
 	return changed
@@ -321,13 +317,6 @@ func (r *ReleaseReconciler) reconcileKCMTemplates(ctx context.Context, releaseNa
 			return false, fmt.Errorf("some of the predeclared Secrets (%v) are missing (%v) in the %s namespace", helmRepositorySecrets, missingSecrets, r.SystemNamespace)
 		}
 
-		if r.DefaultRegistryConfig.CertSecretName != "" {
-			err = r.patchFluxWithRegistryCASecret(ctx)
-			if err != nil {
-				return false, fmt.Errorf("failed to patch flux components with registry CA secret volume: %w", err)
-			}
-		}
-
 		releaseName, err = releaseutil.ReleaseNameFromVersion(build.Version)
 		if err != nil {
 			return false, fmt.Errorf("failed to get Release name from version %q: %w", build.Version, err)
@@ -375,7 +364,7 @@ func (r *ReleaseReconciler) reconcileKCMTemplates(ctx context.Context, releaseNa
 
 	opts := helm.ReconcileHelmReleaseOpts{
 		ChartRef: &helmcontrollerv2.CrossNamespaceSourceReference{
-			Kind:      helmChart.Kind,
+			Kind:      sourcev1.HelmChartKind,
 			Name:      helmChart.Name,
 			Namespace: helmChart.Namespace,
 		},
@@ -413,71 +402,6 @@ func (r *ReleaseReconciler) reconcileKCMTemplates(ctx context.Context, releaseNa
 	return false, nil
 }
 
-// Workaround for Flux issue https://github.com/fluxcd/flux2/issues/4838.
-// Applies only to the initial deployment to add the registry
-// CA certificate to flux components before installing kcm-templates HelmChart
-func (r *ReleaseReconciler) patchFluxWithRegistryCASecret(ctx context.Context) error {
-	const (
-		deploymentName       = "source-controller"
-		caCertVolumeName     = "registry-cert"
-		caCertFileName       = "registry-ca.pem"
-		managerContainerName = "manager"
-	)
-
-	deployment := &appsv1.Deployment{}
-	if err := r.Get(ctx, client.ObjectKey{Name: deploymentName, Namespace: r.SystemNamespace}, deployment); err != nil {
-		return err
-	}
-
-	managerIdx := slices.IndexFunc(deployment.Spec.Template.Spec.Containers, func(c corev1.Container) bool {
-		return c.Name == managerContainerName
-	})
-	if managerIdx == -1 {
-		return fmt.Errorf("container %q not found in deployment %q", managerContainerName, deploymentName)
-	}
-
-	hasVolume := slices.ContainsFunc(deployment.Spec.Template.Spec.Volumes, func(v corev1.Volume) bool {
-		return v.Name == caCertVolumeName
-	})
-	hasMount := slices.ContainsFunc(deployment.Spec.Template.Spec.Containers[managerIdx].VolumeMounts, func(vm corev1.VolumeMount) bool {
-		return vm.Name == caCertVolumeName
-	})
-
-	if hasVolume && hasMount {
-		return nil
-	}
-
-	patchHelper, err := patch.NewHelper(deployment, r.Client)
-	if err != nil {
-		return err
-	}
-
-	if !hasVolume {
-		deployment.Spec.Template.Spec.Volumes = append(deployment.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name: caCertVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					DefaultMode: pointerutil.To(int32(420)),
-					Items: []corev1.KeyToPath{
-						{Key: "ca.crt", Path: caCertFileName},
-					},
-					SecretName: r.DefaultRegistryConfig.CertSecretName,
-				},
-			},
-		})
-	}
-
-	if !hasMount {
-		manager := &deployment.Spec.Template.Spec.Containers[managerIdx]
-		manager.VolumeMounts = append(manager.VolumeMounts, corev1.VolumeMount{
-			Name:      caCertVolumeName,
-			MountPath: "/etc/ssl/certs/" + caCertFileName,
-			SubPath:   caCertFileName,
-		})
-	}
-	return patchHelper.Patch(ctx, deployment)
-}
-
 func (r *ReleaseReconciler) getCurrentRelease(ctx context.Context) (*kcmv1.Release, error) {
 	releases := &kcmv1.ReleaseList{}
 	listOptions := client.ListOptions{
@@ -490,14 +414,6 @@ func (r *ReleaseReconciler) getCurrentRelease(ctx context.Context) (*kcmv1.Relea
 		return nil, fmt.Errorf("expected 1 Release with version %s, found %d", build.Version, len(releases.Items))
 	}
 	return &releases.Items[0], nil
-}
-
-func (*ReleaseReconciler) eventf(release *kcmv1.Release, reason, message string, args ...any) {
-	record.Eventf(release, release.Generation, reason, message, args...)
-}
-
-func (*ReleaseReconciler) warnf(release *kcmv1.Release, reason, message string, args ...any) {
-	record.Warnf(release, release.Generation, reason, message, args...)
 }
 
 // SetupWithManager sets up the controller with the Manager.

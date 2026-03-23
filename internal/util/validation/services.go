@@ -18,9 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/validation"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kcmv1 "github.com/K0rdent/kcm/api/v1beta1"
@@ -37,6 +37,18 @@ var (
 func ServicesHaveValidTemplates(ctx context.Context, cl client.Client, services []kcmv1.Service, ns string) error {
 	var errs error
 	for _, svc := range services {
+		if svc.Namespace != "" {
+			for _, msg := range validation.ValidateNamespaceName(svc.Namespace, false) {
+				errs = errors.Join(errs, field.Invalid(field.NewPath("namespace"), svc.Namespace, msg))
+			}
+		}
+
+		if svc.Name != "" {
+			for _, msg := range validation.ValidateNamespaceName(svc.Name, false) {
+				errs = errors.Join(errs, field.Invalid(field.NewPath("name"), svc.Name, msg))
+			}
+		}
+
 		errs = errors.Join(errs, validateServiceTemplate(ctx, cl, svc, ns))
 		if svc.TemplateChain == "" {
 			continue
@@ -102,54 +114,6 @@ func validateServiceTemplateChain(ctx context.Context, cl client.Client, svc kcm
 		errs = errors.Join(errs, fmt.Errorf("the ServiceTemplateChain %s does not support ServiceTemplate %s", key, svc.Template))
 	}
 
-	return errs
-}
-
-func ValidateUpgradePaths(services []kcmv1.Service, upgradePaths []kcmv1.ServiceUpgradePaths) error {
-	observedTemplatesMap := make(map[string]struct {
-		Template     string
-		UpgradePaths []kcmv1.UpgradePath
-	}, len(upgradePaths))
-	for _, observedService := range upgradePaths {
-		observedServiceNamespacedName := client.ObjectKey{Name: observedService.Name, Namespace: observedService.Namespace}
-		observedTemplatesMap[observedServiceNamespacedName.String()] = struct {
-			Template     string
-			UpgradePaths []kcmv1.UpgradePath
-		}{Template: observedService.Template, UpgradePaths: observedService.AvailableUpgrades}
-	}
-	var errs error
-	for _, svc := range services {
-		serviceNamespacedName := client.ObjectKey{Name: svc.Name, Namespace: svc.Namespace}
-		if svc.Namespace == "" {
-			serviceNamespacedName.Namespace = metav1.NamespaceDefault
-		}
-		currentTemplate, ok := observedTemplatesMap[serviceNamespacedName.String()]
-		// if the desired service namespaced name does not exist in observed installed
-		// services, then it means it is a new service, therefore nothing to validate.
-		if !ok {
-			continue
-		}
-		// if the desired service template matches observed template of the service with
-		// given namespaced name, then it means there are no changes to the service,
-		// therefore nothing to validate.
-		if svc.Template == currentTemplate.Template {
-			continue
-		}
-		// if desired service template is not in observed upgrade paths, then return false
-		// otherwise continue validation
-		canUpgrade := false
-		for _, upgradePath := range currentTemplate.UpgradePaths {
-			if slices.ContainsFunc(upgradePath.Versions, func(upgrade kcmv1.AvailableUpgrade) bool {
-				return svc.Template == upgrade.Name
-			}) {
-				canUpgrade = true
-				break
-			}
-		}
-		if !canUpgrade {
-			errs = errors.Join(errs, fmt.Errorf("service %s can't be upgraded from %s to %s", serviceNamespacedName, currentTemplate.Template, svc.Template))
-		}
-	}
 	return errs
 }
 

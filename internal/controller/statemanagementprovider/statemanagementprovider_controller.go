@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
@@ -63,18 +64,17 @@ const (
 )
 
 type (
-	DiscoveryClientFunc func(*rest.Config) (discovery.DiscoveryInterface, error)
-	DynamicClientFunc   func(*rest.Config) (dynamic.Interface, error)
+	DynamicClientFunc func(*rest.Config) (dynamic.Interface, error)
 )
 
 // Reconciler reconciles a StateManagementProvider object
 type Reconciler struct {
 	client.Client
 
-	discoveryClientFunc DiscoveryClientFunc
-	dynamicClientFunc   DynamicClientFunc
+	dynamicClientFunc DynamicClientFunc
 
 	config          *rest.Config
+	restMapper      apimeta.RESTMapper
 	timeFunc        func() time.Time
 	SystemNamespace string
 }
@@ -100,14 +100,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 
 	if smp.Spec.Selector == nil {
-		record.Eventf(smp, smp.Generation, kcmv1.StateManagementProviderSelectorNotDefinedEvent,
+		record.Eventf(smp, nil, kcmv1.StateManagementProviderSelectorNotDefinedEvent, "Reconcile",
 			"StateManagementProvider %s has no selector defined, skipping reconciliation", smp.Name)
 		l.V(1).Info("StateManagementProvider has no selector defined, skipping reconciliation")
 		return ctrl.Result{}, nil
 	}
 
 	if smp.Spec.Suspend {
-		record.Eventf(smp, smp.Generation, kcmv1.StateManagementProviderSuspendedEvent,
+		record.Eventf(smp, nil, kcmv1.StateManagementProviderSuspendedEvent, "Reconcile",
 			"StateManagementProvider %s is suspended, skipping reconciliation", smp.Name)
 		l.Info("StateManagementProvider is suspended, skipping")
 		return ctrl.Result{}, nil
@@ -132,7 +132,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// We'll ensure RBAC resources first and return in case of an error. Without RBAC
 	// resources, we'll not be able to reconcile other resources.
 	if reconcileErr := r.ensureRBAC(ctx, smp); reconcileErr != nil {
-		record.Warnf(smp, smp.Generation, kcmv1.StateManagementProviderFailedRBACEvent,
+		record.Warnf(smp, nil, kcmv1.StateManagementProviderFailedRBACEvent, "EnsureRBAC",
 			"Failed to ensure RBAC for %s %s: %v", kcmv1.StateManagementProviderKind, client.ObjectKeyFromObject(smp), reconcileErr)
 		return ctrl.Result{}, reconcileErr
 	}
@@ -142,17 +142,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// Errors will be joined and returned at the end of the reconciliation.
 	config := impersonationConfigForServiceAccount(r.config, smp.Name, r.SystemNamespace)
 	if reconcileErr := r.ensureAdapter(ctx, config, smp); reconcileErr != nil {
-		record.Warnf(smp, smp.Generation, kcmv1.StateManagementProviderFailedAdapterEvent,
+		record.Warnf(smp, nil, kcmv1.StateManagementProviderFailedAdapterEvent, "EnsureAdapter",
 			"Failed to ensure adapter for %s %s: %v", kcmv1.StateManagementProviderKind, client.ObjectKeyFromObject(smp), reconcileErr)
 		err = errors.Join(err, reconcileErr)
 	}
 	if reconcileErr := r.ensureProvisioner(ctx, config, smp); reconcileErr != nil {
-		record.Warnf(smp, smp.Generation, kcmv1.StateManagementProviderFailedProvisionerEvent,
+		record.Warnf(smp, nil, kcmv1.StateManagementProviderFailedProvisionerEvent, "EnsureProvisioner",
 			"Failed to ensure provisioner for %s %s: %v", kcmv1.StateManagementProviderKind, client.ObjectKeyFromObject(smp), reconcileErr)
 		err = errors.Join(err, reconcileErr)
 	}
 	if reconcileErr := r.ensureProvisionerCRDs(ctx, config, smp); reconcileErr != nil {
-		record.Warnf(smp, smp.Generation, kcmv1.StateManagementProviderFailedProvisionerCRDsEvent,
+		record.Warnf(smp, nil, kcmv1.StateManagementProviderFailedProvisionerCRDsEvent, "EnsureProvisionerCRDs",
 			"Failed to ensure provisioner CRDs for %s %s: %v", kcmv1.StateManagementProviderKind, client.ObjectKeyFromObject(smp), reconcileErr)
 		err = errors.Join(err, reconcileErr)
 	}
@@ -166,9 +166,14 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	r.config = mgr.GetConfig()
 
-	r.discoveryClientFunc = func(config *rest.Config) (discovery.DiscoveryInterface, error) {
-		return discovery.NewDiscoveryClientForConfig(config)
+	// Initialize cached discovery client and REST mapper once at startup
+	dc, err := discovery.NewDiscoveryClientForConfig(r.config)
+	if err != nil {
+		return fmt.Errorf("failed to create discovery client: %w", err)
 	}
+	cachedDiscovery := memory.NewMemCacheClient(dc)
+	r.restMapper = restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscovery)
+
 	r.dynamicClientFunc = func(config *rest.Config) (dynamic.Interface, error) {
 		return dynamic.NewForConfig(config)
 	}
@@ -199,13 +204,13 @@ func (r *Reconciler) ensureRBAC(ctx context.Context, smp *kcmv1.StateManagementP
 	defer func() {
 		if updateCondition(smp, rbacCondition, status, reason, message, r.timeFunc()) && status == metav1.ConditionTrue {
 			l.Info("Successfully ensured RBAC")
-			record.Eventf(smp, smp.Generation, kcmv1.StateManagementProviderSuccessRBACEvent,
+			record.Eventf(smp, nil, kcmv1.StateManagementProviderSuccessRBACEvent, "EnsureRBAC",
 				"Successfully ensured RBAC for %s %s", kcmv1.StateManagementProviderKind, client.ObjectKeyFromObject(smp))
 		}
 		l.V(1).Info("Finished ensuring RBAC", "duration", time.Since(start))
 	}()
 
-	adapterGVR, err := r.gvrFromResourceReference(ctx, r.config, smp.Spec.Adapter)
+	adapterGVR, err := r.gvrFromResourceReference(ctx, smp.Spec.Adapter)
 	if err != nil {
 		reason = kcmv1.StateManagementProviderRBACFailedToGetGVKForAdapterReason
 		message = fmt.Sprintf("Failed to ensure RBAC: %v", err)
@@ -214,7 +219,7 @@ func (r *Reconciler) ensureRBAC(ctx context.Context, smp *kcmv1.StateManagementP
 	gvrList := []schema.GroupVersionResource{adapterGVR}
 
 	for _, provisioner := range smp.Spec.Provisioner {
-		provisionerGVR, err := r.gvrFromResourceReference(ctx, r.config, provisioner)
+		provisionerGVR, err := r.gvrFromResourceReference(ctx, provisioner)
 		if err != nil {
 			reason = kcmv1.StateManagementProviderRBACFailedToGetGVKForProvisionerReason
 			message = fmt.Sprintf("Failed to ensure RBAC: %v", err)
@@ -412,7 +417,7 @@ func (r *Reconciler) ensureAdapter(ctx context.Context, config *rest.Config, smp
 	defer func() {
 		if updateCondition(smp, adapterCondition, status, reason, message, r.timeFunc()) && status == metav1.ConditionTrue {
 			l.Info("Successfully ensured adapter")
-			record.Eventf(smp, smp.Generation, kcmv1.StateManagementProviderSuccessAdapterEvent,
+			record.Eventf(smp, nil, kcmv1.StateManagementProviderSuccessAdapterEvent, "EnsureAdapter",
 				"Successfully ensured adapter for %s %s", kcmv1.StateManagementProviderKind, client.ObjectKeyFromObject(smp))
 		}
 		l.V(1).Info("Finished ensuring adapter", "duration", time.Since(start))
@@ -453,7 +458,7 @@ func (r *Reconciler) ensureProvisioner(ctx context.Context, config *rest.Config,
 	defer func() {
 		if updateCondition(smp, provisionerCondition, status, reason, message, r.timeFunc()) && status == metav1.ConditionTrue {
 			l.Info("Successfully ensured provisioner")
-			record.Eventf(smp, smp.Generation, kcmv1.StateManagementProviderSuccessProvisionerEvent,
+			record.Eventf(smp, nil, kcmv1.StateManagementProviderSuccessProvisionerEvent, "EnsureProvisioner",
 				"Successfully ensured provisioner for %s %s", kcmv1.StateManagementProviderKind, client.ObjectKeyFromObject(smp))
 		}
 		l.V(1).Info("Finished ensuring provisioner", "duration", time.Since(start))
@@ -503,7 +508,7 @@ func (r *Reconciler) ensureProvisionerCRDs(ctx context.Context, config *rest.Con
 	defer func() {
 		if updateCondition(smp, gvrCondition, status, reason, message, r.timeFunc()) && status == metav1.ConditionTrue {
 			l.Info("Successfully ensured provisioner CRDs")
-			record.Eventf(smp, smp.Generation, kcmv1.StateManagementProviderSuccessProvisionerCRDsEvent,
+			record.Eventf(smp, nil, kcmv1.StateManagementProviderSuccessProvisionerCRDsEvent, "EnsureProvisionerCRDs",
 				"Successfully ensured provisioner CRDs for %s %s", kcmv1.StateManagementProviderKind, client.ObjectKeyFromObject(smp))
 		}
 		l.V(1).Info("Finished ensuring provisioner CRDs", "duration", time.Since(start))
@@ -572,7 +577,7 @@ func buildRBACRules(gvrList []schema.GroupVersionResource) []rbacv1.PolicyRule {
 func (r *Reconciler) getReferencedObject(ctx context.Context, config *rest.Config, ref kcmv1.ResourceReference) (*unstructured.Unstructured, error) {
 	l := ctrl.LoggerFrom(ctx)
 	l.Info("Getting referenced object", "ref", ref)
-	gvr, err := r.gvrFromResourceReference(ctx, config, ref)
+	gvr, err := r.gvrFromResourceReference(ctx, ref)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get GVK from resource reference %s: %w", ref, err)
 	}
@@ -589,9 +594,11 @@ func (r *Reconciler) getReferencedObject(ctx context.Context, config *rest.Confi
 }
 
 // gvrFromResourceReference returns the GVR for the given resource reference.
-func (r *Reconciler) gvrFromResourceReference(ctx context.Context, config *rest.Config, ref kcmv1.ResourceReference) (schema.GroupVersionResource, error) {
+func (r *Reconciler) gvrFromResourceReference(ctx context.Context, ref kcmv1.ResourceReference) (schema.GroupVersionResource, error) {
 	l := ctrl.LoggerFrom(ctx)
-	l.Info("Getting GVR from resource reference", "resource_reference", ref)
+	l.V(1).Info("Getting GVR from resource reference", "resource_reference", ref)
+
+	// Parse GVK from reference
 	gvk := schema.GroupVersionKind{
 		Kind: ref.Kind,
 	}
@@ -603,25 +610,15 @@ func (r *Reconciler) gvrFromResourceReference(ctx context.Context, config *rest.
 		gvk.Group = groupVersion[0]
 		gvk.Version = groupVersion[1]
 	default:
-		err := fmt.Errorf("invalid API version %s", ref.APIVersion)
-		return schema.GroupVersionResource{}, fmt.Errorf("failed to get GVR from resource reference %s: %w", ref, err)
+		return schema.GroupVersionResource{}, fmt.Errorf("invalid API version %s for resource reference %s", ref.APIVersion, ref)
 	}
 
-	dc, err := r.discoveryClientFunc(config)
-	if err != nil {
-		return schema.GroupVersionResource{}, fmt.Errorf("failed to create discovery client: %w", err)
-	}
-
-	apiResources, err := restmapper.GetAPIGroupResources(dc)
-	if err != nil {
-		return schema.GroupVersionResource{}, fmt.Errorf("failed to get API group resources: %w", err)
-	}
-
-	mapper := restmapper.NewDiscoveryRESTMapper(apiResources)
-	mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	// Use cached REST mapper (auto-invalidates on errors and retries)
+	mapping, err := r.restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 	if err != nil {
 		return schema.GroupVersionResource{}, fmt.Errorf("failed to get REST mapping for %s: %w", gvk.String(), err)
 	}
+
 	l.V(1).Info("Found GVR", "gvr", mapping.Resource)
 	return mapping.Resource, nil
 }

@@ -1,3 +1,4 @@
+{{- $global := .Values.global | default dict }}
 {{- $tel := .Values.telemetry -}}
 {{- $telController := .Values.telemetry.controller -}}
 {{- $isTelemetryEnabled := ne $tel.mode "disabled" -}}
@@ -23,7 +24,11 @@ spec:
       {{- if $isLocalTelemetry }}
       initContainers:
         - name: telemetry-data-permissions
-          image: busybox:latest
+          image: {{ if $global.registry }}
+          {{- $global.registry }}/busybox
+          {{- else }}
+          {{- $telController.image.initContainer.repository }}
+          {{- end }}:{{ $telController.image.initContainer.tag }}
           command: ["sh","-c","chown -R 65532:65532 {{ $baseDir }} || true"]
           securityContext:
             runAsUser: 0
@@ -50,13 +55,23 @@ spec:
         {{- if $isLocalTelemetry }}
         - --telemetry-base-dir={{ $baseDir }}
         {{- end }}
+        {{- if $tel.extraResource }}
+        - --telemetry-resource={{ $tel.extraResource }}
+        {{- end }}
+        {{- if $tel.extraCEL }}
+        - {{ printf "--telemetry-cel=%s" $tel.extraCEL | quote }}
+        {{- end }}
         - --metrics-bind-address=127.0.0.1:8080
         - --health-probe-bind-address=:8081
         - --metrics-secure=false
         - --pprof-bind-address={{ $telController.debug.pprofBindAddress }}
         command:
         - /telemetry
-        image: {{ $telController.image.repository }}:{{ $telController.image.tag | default .Chart.AppVersion }}
+        image: {{ if $global.registry }}
+        {{- $global.registry }}/kcm-telemetry
+        {{- else }}
+        {{- $telController.image.repository }}
+        {{- end }}:{{ $telController.image.tag | default .Chart.AppVersion }}
         imagePullPolicy: {{ $telController.image.pullPolicy }}
         name: telemetry
         ports:
@@ -66,6 +81,12 @@ spec:
           - containerPort: 8080
             name: metrics
             protocol: TCP
+        {{- $proxy := $global.proxy | default dict }}
+        {{- if and $telController.proxy.enabled $proxy.secretName }}
+        env:
+        - name: PROXY_SECRET
+          value: {{ $proxy.secretName | quote }}
+        {{- end }}
         livenessProbe:
           httpGet:
             path: /healthz
@@ -105,6 +126,11 @@ spec:
         runAsNonRoot: true
       serviceAccountName: {{ include "kcm-regional.fullname" . }}-telemetry
       terminationGracePeriodSeconds: 10
+      {{- if $global.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml $global.imagePullSecrets | nindent 8 }}
+      {{- else if .Values.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml .Values.imagePullSecrets | nindent 8 }}
+      {{- end }}
       {{- if $isLocalTelemetry }}
       volumes:
         - name: telemetry-storage

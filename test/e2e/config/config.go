@@ -30,13 +30,15 @@ import (
 type TestingProvider string
 
 const (
-	TestingProviderAWS     TestingProvider = "aws"
-	TestingProviderAzure   TestingProvider = "azure"
-	TestingProviderGCP     TestingProvider = "gcp"
-	TestingProviderVsphere TestingProvider = "vsphere"
-	TestingProviderAdopted TestingProvider = "adopted"
-	TestingProviderRemote  TestingProvider = "remote"
-	TestingProviderDocker  TestingProvider = "docker"
+	TestingProviderAWS        TestingProvider = "aws"
+	TestingProviderAzure      TestingProvider = "azure"
+	TestingProviderGCP        TestingProvider = "gcp"
+	TestingProviderOpenstack  TestingProvider = "openstack"
+	TestingProviderVsphere    TestingProvider = "vsphere"
+	TestingProviderAdopted    TestingProvider = "adopted"
+	TestingProviderRemote     TestingProvider = "remote"
+	TestingProviderDocker     TestingProvider = "docker"
+	TestingProviderMothership TestingProvider = "mothership"
 )
 
 type Architecture string
@@ -103,10 +105,11 @@ func initialize() {
 		TestingProviderAWS,
 		TestingProviderAzure,
 		TestingProviderGCP,
+		TestingProviderOpenstack,
 		TestingProviderVsphere,
 		TestingProviderAdopted,
 		TestingProviderRemote,
-		TestingProviderDocker,
+		TestingProviderMothership,
 	}
 
 	Config = make(map[TestingProvider][]ProviderTestingConfig)
@@ -121,13 +124,6 @@ func applyDefaultConfiguration() {
 			Config[provider] = getDefaultTestingConfiguration()
 		}
 	}
-}
-
-func Show() string {
-	prettyConfig, err := yaml.Marshal(Config)
-	Expect(err).NotTo(HaveOccurred())
-
-	return string(prettyConfig)
 }
 
 func UpgradeRequired() bool {

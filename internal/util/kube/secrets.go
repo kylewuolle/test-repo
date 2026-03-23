@@ -23,12 +23,16 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	kcmv1 "github.com/K0rdent/kcm/api/v1beta1"
+	"github.com/K0rdent/kcm/internal/record"
 )
+
+// ProxySecretEnvName is the name of the env variable holding the Secret name with the proxy data.
+const ProxySecretEnvName = "PROXY_SECRET"
 
 // CheckAllSecretsExistInNamespace returns positive if all of the Secrets with the given names
 // exist in the given namespace.
@@ -88,7 +92,7 @@ func getPredeclaredSecretsExistCondition(generation int64, failedMsg string) met
 // In either case, sets the [github.com/K0rdent/kcm/api/v1beta1.PredeclaredSecretsExistCondition] condition with corresponding status.
 //
 // Does nothing if all of the given names are empty.
-func SetPredeclaredSecretsCondition(ctx context.Context, cl client.Client, base ObjectConditionGetter, eventFn func(runtime.Object, int64, string, string, ...any), namespace string, names ...string) (changed bool, err error) {
+func SetPredeclaredSecretsCondition(ctx context.Context, cl client.Client, base ObjectConditionGetter, namespace string, names ...string) (changed bool, err error) {
 	if len(names) == 0 {
 		return false, nil
 	}
@@ -120,7 +124,7 @@ func SetPredeclaredSecretsCondition(ctx context.Context, cl client.Client, base 
 	missingMsg := fmt.Sprintf("Some of the predeclared Secrets (%v) are missing (%v) in the %s namespace", names, missingSecrets, namespace)
 
 	if changed = meta.SetStatusCondition(base.GetConditions(), getPredeclaredSecretsExistCondition(base.GetGeneration(), missingMsg)); changed {
-		eventFn(base, base.GetGeneration(), "MissingDeclaredSecrets", missingMsg)
+		record.Warnf(base, nil, "MissingDeclaredSecrets", "CheckExistence", missingMsg)
 	}
 
 	return changed, fmt.Errorf("missing secret names: %v", missingSecrets)
@@ -160,7 +164,10 @@ func CopySecret(
 	newSecret.SetUID("")
 
 	if owner != nil {
-		AddOwnerReference(newSecret, owner)
+		err := controllerutil.SetOwnerReference(owner, newSecret, targetClient.Scheme())
+		if err != nil {
+			return fmt.Errorf("failed to set owner reference on Secret: %w", err)
+		}
 	}
 
 	newSecret.SetNamespace(toNamespace)

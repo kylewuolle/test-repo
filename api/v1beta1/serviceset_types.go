@@ -15,6 +15,7 @@
 package v1beta1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -56,6 +57,17 @@ const (
 	// ServiceSetProfileReadyMessage is the message for the profile is ready
 	ServiceSetProfileReadyMessage = "Profile is ready"
 
+	// ServiceSetStatusesCollectedCondition is the condition type for ServiceSet statuses collection
+	ServiceSetStatusesCollectedCondition = "ServiceSetStatusesCollected"
+	// ServiceSetStatusesCollectedReason is the reason for the statuses collection is ready
+	ServiceSetStatusesCollectedReason = "ServiceSetStatusesCollected"
+	// ServiceSetStatusesCollectedMessage is the message for the statuses collection is ready
+	ServiceSetStatusesCollectedMessage = "Statuses collected"
+	// ServiceSetStatusesNotCollectedReason is the reason for the statuses collection is not ready
+	ServiceSetStatusesNotCollectedReason = "ServiceSetStatusesNotCollected"
+	// ServiceSetStatusesNotCollectedMessage is the message for the statuses collection is not ready
+	ServiceSetStatusesNotCollectedMessage = "Statuses not collected"
+
 	// ServiceSetProfileBuildFailedReason is the reason for the profile build failed
 	ServiceSetProfileBuildFailedReason = "ServiceSetProfileBuildFailed"
 	// ServiceSetHelmChartsBuildFailedReason is the reason for the Helm charts build failed
@@ -77,8 +89,18 @@ const (
 	ServiceSetEnsureProfileFailedEvent = "ServiceSetEnsureProfileFailed"
 	// ServiceSetEnsureProfileSuccessEvent indicates the event for Profile create or update succeeded
 	ServiceSetEnsureProfileSuccessEvent = "ServiceSetEnsureProfileSuccess"
+	// ServiceSetCollectServiceStatusesSuccessEvent indicates the event for services status collection succeeded
+	ServiceSetCollectServiceStatusesSuccessEvent = "ServiceSetCollectServiceStatusesSuccess"
 	// ServiceSetCollectServiceStatusesFailedEvent indicates the event for services status collection failed
 	ServiceSetCollectServiceStatusesFailedEvent = "ServiceSetCollectServiceStatusesFailed"
+
+	ServiceSetReconcileEventAction              = "Reconcile"
+	ServiceSetEnsureProfileEventAction          = "EnsureProfile"
+	ServiceSetBuildProfileEventAction           = "BuildProfile"
+	ServiceSetBuildHelmChartsEventAction        = "BuildHelmCharts"
+	ServiceSetBuildKustomizationRefsEventAction = "BuildKustomizationRefs"
+	ServiceSetBuildPolicyRefsEventAction        = "BuildPolicyRefs"
+	ServiceSetCollectServiceStatusesEventAction = "CollectServiceStatuses"
 
 	// ServiceSetIsBeingDeletedEvent indicates the event for services set being deleted.
 	ServiceSetIsBeingDeletedEvent = "ServiceSetIsBeingDeleted"
@@ -91,7 +113,6 @@ type ServiceSetOperation string
 const (
 	ServiceSetOperationCreate ServiceSetOperation = "create"
 	ServiceSetOperationUpdate ServiceSetOperation = "update"
-	ServiceSetOperationDelete ServiceSetOperation = "delete"
 	ServiceSetOperationNone   ServiceSetOperation = "none"
 )
 
@@ -129,11 +150,19 @@ type ServiceWithValues struct {
 	// HelmOptions are the options to be passed to the provider for helm installation or updates
 	HelmOptions *ServiceHelmOptions `json:"helmOptions,omitempty"`
 
+	// +optional
+
+	// Version is the version of the service.
+	Version *string `json:"version,omitempty"`
+
+	// +kubebuilder:validation:Enum:=Install;Uninstall
+
+	// HelmChartAction specifies action on an helm chart
+	HelmAction *string `json:"helmAction,omitempty"`
+
 	// Name is the name of the service. If the ServiceTemplate is backed by Helm chart,
 	// then the name is the name of the Helm release.
 	Name string `json:"name"`
-
-	Version string `json:"version"`
 
 	// Namespace is the namespace where the service is deployed. If the ServiceTemplate
 	// is backed by Helm chart, then the namespace is the namespace where the Helm release is deployed.
@@ -147,12 +176,6 @@ type ServiceWithValues struct {
 
 	// ValuesFrom is the list of sources of the values to pass to the ServiceTemplate.
 	ValuesFrom []ValuesFrom `json:"valuesFrom,omitempty"`
-
-	// When set to true it indicates the service is pending an upgrade
-	Pending bool `json:"pending,omitempty"`
-
-	// When set to true indicates the service is being upgraded
-	Upgrade bool `json:"upgrade,omitempty"`
 }
 
 // ValuesFrom is the source of the values to pass to the ServiceTemplate. The source
@@ -169,6 +192,9 @@ type ValuesFrom struct {
 
 // ServiceSetStatus defines the observed state of ServiceSet
 type ServiceSetStatus struct {
+	// Cluster contains [k8s.io/api/core/v1.ObjectReference] to the cluster object.
+	Cluster *corev1.ObjectReference `json:"cluster,omitempty"`
+
 	// +patchMergeKey=type
 	// +patchStrategy=merge
 	// +listType=map
@@ -217,8 +243,10 @@ type ServiceState struct {
 	// Template is the name of the ServiceTemplate used to deploy the Service
 	Template string `json:"template"`
 
+	// +optional
+
 	// Version is the version of the Service
-	Version string `json:"version"`
+	Version *string `json:"version,omitempty"`
 
 	// State is the state of the Service
 	// +kubebuilder:validation:Enum=Deployed;Provisioning;Failed;Pending;Deleting
@@ -238,6 +266,10 @@ type ServiceState struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="cluster",type=string,JSONPath=`.spec.cluster`,description="Corresponding ClusterDeployment name",priority=0
+// +kubebuilder:printcolumn:name="multiClusterServer",type=string,JSONPath=`.spec.multiClusterService`,description="Corresponding MultiClusterService name",priority=0
+// +kubebuilder:printcolumn:name="provider",type=string,JSONPath=`.spec.provider.name`,description="StateManagementProvider name",priority=0
+// +kubebuilder:printcolumn:name="self-management",type=boolean,JSONPath=`.spec.provider.selfManagement`,description="Is the ServiceSet for self-management",priority=0
 // +kubebuilder:printcolumn:name="age",type=date,JSONPath=`.metadata.creationTimestamp`,description="Time elapsed since object creation",priority=0
 
 // ServiceSet is the Schema for the servicesets API

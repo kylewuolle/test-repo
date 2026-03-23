@@ -50,15 +50,17 @@ import (
 )
 
 type config struct {
-	templatesRepoURL              string
+	kcmTemplatesChartName         string
 	determinedRepositoryType      string
 	registryCredentialsSecretName string
 	registryCertSecretName        string
+	imagePullSecretName           string
 	globalRegistry                string
 	globalK0sURL                  string
 	k0sURLCertSecretName          string
-	kcmTemplatesChartName         string
-	createManagement              bool
+	templatesRepoURL              string
+	defaultHelmTimeout            time.Duration
+	maxConcurrentReconciles       int
 	insecureRegistry              bool
 	createAccessManagement        bool
 	enableWebhook                 bool
@@ -66,7 +68,8 @@ type config struct {
 	createTemplates               bool
 	enableSveltosCtrl             bool
 	enableSveltosExpireCtrl       bool
-	defaultHelmTimeout            time.Duration
+	createManagement              bool
+	fluxEnabled                   bool
 }
 
 var (
@@ -85,6 +88,7 @@ func main() {
 		globalK0sURL                  string
 		insecureRegistry              bool
 		registryCredentialsSecretName string
+		imagePullSecretName           string
 		registryCertSecretName        string
 		k0sURLCertSecretName          string
 		createManagement              bool
@@ -101,6 +105,8 @@ func main() {
 		enableSveltosCtrl             bool
 		enableSveltosExpireCtrl       bool
 		defaultHelmTimeout            time.Duration
+		maxConcurrentReconciles       int
+		fluxEnabled                   bool
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
@@ -118,6 +124,8 @@ func main() {
 		"K0s URL prefix which will be passed directly as global.k0sURL to all ClusterDeployments configs")
 	flag.StringVar(&registryCredentialsSecretName, "registry-creds-secret", "",
 		"Name of a Secret containing authentication credentials for the registry.")
+	flag.StringVar(&imagePullSecretName, "image-pull-secret", "",
+		"Name of a Secret containing dockerconfigjson used to pull images from the registry.")
 	flag.StringVar(&registryCertSecretName, "registry-cert-secret-name", "",
 		"Name of a Secret containing root CA certificate (`ca.crt`) for connecting to the registry endpoint.")
 	flag.StringVar(&k0sURLCertSecretName, "k0s-url-cert-secret-name", "", "Name of a Secret containing root CA certificate (`ca.crt`) for the k0s download URL.")
@@ -138,6 +146,8 @@ func main() {
 	flag.BoolVar(&enableSveltosCtrl, "enable-sveltos-ctrl", true, "Enable Sveltos built-in provider controller")
 	flag.BoolVar(&enableSveltosExpireCtrl, "enable-sveltos-expire-ctrl", false, "Enable SveltosCluster stuck (expired) tokens controller")
 	flag.DurationVar(&defaultHelmTimeout, "default-helm-timeout", 0, "Specifies the timeout duration for Helm install or upgrade operations. If unset, Flux’s default value will be used")
+	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 10, "Specifies the maximum number of concurrent reconciles that will be run for each controller.")
+	flag.BoolVar(&fluxEnabled, "flux-enabled", true, "The flag that indicates whether Flux integration is enabled")
 
 	// TODO: remove in one of the upcoming releases
 	_ = flag.Bool("enable-telemetry", false, "[Deprecated] Has no effect, use a dedicated telemetry chart")
@@ -237,15 +247,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	record.InitFromRecorder(mgr.GetEventRecorderFor("kcm-controller-manager"))
+	record.InitFromRecorder(mgr.GetEventRecorder("kcm-controller-manager"))
 
-	currentNamespace := kubeutil.CurrentNamespace()
+	systemNamespace := kubeutil.CurrentNamespace()
 
 	cfg := config{
 		createManagement:              createManagement,
 		templatesRepoURL:              templatesRepoURL,
 		determinedRepositoryType:      determinedRepositoryType,
 		registryCredentialsSecretName: registryCredentialsSecretName,
+		imagePullSecretName:           imagePullSecretName,
 		registryCertSecretName:        registryCertSecretName,
 		insecureRegistry:              insecureRegistry,
 		createAccessManagement:        createAccessManagement,
@@ -259,8 +270,9 @@ func main() {
 		enableSveltosCtrl:             enableSveltosCtrl,
 		enableSveltosExpireCtrl:       enableSveltosExpireCtrl,
 		defaultHelmTimeout:            defaultHelmTimeout,
+		fluxEnabled:                   fluxEnabled,
 	}
-	if err := setupControllers(mgr, currentNamespace, cfg); err != nil {
+	if err := setupControllers(mgr, systemNamespace, cfg); err != nil {
 		setupLog.Error(err, "failed to setup controllers")
 		os.Exit(1)
 	}
@@ -277,7 +289,7 @@ func main() {
 	}
 
 	if enableWebhook {
-		if err := setupWebhooks(mgr, currentNamespace, validateClusterUpgradePath); err != nil {
+		if err := setupWebhooks(mgr, systemNamespace, validateClusterUpgradePath); err != nil {
 			setupLog.Error(err, "failed to setup webhooks")
 			os.Exit(1)
 		}
@@ -338,6 +350,7 @@ func setupControllers(mgr ctrl.Manager, currentNamespace string, cfg config) err
 		GlobalK0sURL:           cfg.globalK0sURL,
 		K0sURLCertSecretName:   cfg.k0sURLCertSecretName,
 		RegistryCertSecretName: cfg.registryCertSecretName,
+		ImagePullSecretName:    cfg.imagePullSecretName,
 		DefaultHelmTimeout:     cfg.defaultHelmTimeout,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Management")
@@ -349,6 +362,7 @@ func setupControllers(mgr ctrl.Manager, currentNamespace string, cfg config) err
 		SystemNamespace:        currentNamespace,
 		GlobalRegistry:         cfg.globalRegistry,
 		RegistryCertSecretName: cfg.registryCertSecretName,
+		ImagePullSecretName:    cfg.imagePullSecretName,
 		DefaultHelmTimeout:     cfg.defaultHelmTimeout,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Region")
@@ -395,6 +409,7 @@ func setupControllers(mgr ctrl.Manager, currentNamespace string, cfg config) err
 			Insecure:              cfg.insecureRegistry,
 		},
 		DefaultHelmTimeout: cfg.defaultHelmTimeout,
+		FluxEnabled:        cfg.fluxEnabled,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Release")
 		return err
@@ -439,9 +454,10 @@ func setupControllers(mgr ctrl.Manager, currentNamespace string, cfg config) err
 
 		setupLog.Info("setting up built-in ServiceSet controller")
 		if err = (&sveltos.ServiceSetReconciler{
-			SystemNamespace:  currentNamespace,
-			AdapterName:      deploymentName,
-			AdapterNamespace: currentNamespace,
+			SystemNamespace:         currentNamespace,
+			AdapterName:             deploymentName,
+			AdapterNamespace:        currentNamespace,
+			MaxConcurrentReconciles: cfg.maxConcurrentReconciles,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "ServiceSet")
 			return err
@@ -460,10 +476,10 @@ func setupControllers(mgr ctrl.Manager, currentNamespace string, cfg config) err
 	return nil
 }
 
-func setupWebhooks(mgr ctrl.Manager, currentNamespace string, validateClusterUpgradePath bool) error {
+func setupWebhooks(mgr ctrl.Manager, systemNamespace string, validateClusterUpgradePath bool) error {
 	if err := (&kcmwebhook.ClusterDeploymentValidator{
 		ValidateClusterUpgradePath: validateClusterUpgradePath,
-		SystemNamespace:            currentNamespace,
+		SystemNamespace:            systemNamespace,
 	}).SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "ClusterDeployment")
 		return err
@@ -476,25 +492,25 @@ func setupWebhooks(mgr ctrl.Manager, currentNamespace string, validateClusterUpg
 		setupLog.Error(err, "unable to create webhook", "webhook", "Management")
 		return err
 	}
-	if err := (&kcmwebhook.RegionValidator{SystemNamespace: currentNamespace}).SetupWebhookWithManager(mgr); err != nil {
+	if err := (&kcmwebhook.RegionValidator{SystemNamespace: systemNamespace}).SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "Region")
 		return err
 	}
-	if err := (&kcmwebhook.AccessManagementValidator{SystemNamespace: currentNamespace}).SetupWebhookWithManager(mgr); err != nil {
+	if err := (&kcmwebhook.AccessManagementValidator{SystemNamespace: systemNamespace}).SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "AccessManagement")
 		return err
 	}
-	if err := (&kcmwebhook.ClusterTemplateChainValidator{}).SetupWebhookWithManager(mgr); err != nil {
+	if err := (&kcmwebhook.ClusterTemplateChainValidator{SystemNamespace: systemNamespace}).SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "ClusterTemplateChain")
 		return err
 	}
-	if err := (&kcmwebhook.ServiceTemplateChainValidator{}).SetupWebhookWithManager(mgr); err != nil {
+	if err := (&kcmwebhook.ServiceTemplateChainValidator{SystemNamespace: systemNamespace}).SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "ServiceTemplateChain")
 		return err
 	}
 
 	templateValidator := kcmwebhook.TemplateValidator{
-		SystemNamespace: currentNamespace,
+		SystemNamespace: systemNamespace,
 	}
 	if err := (&kcmwebhook.ClusterTemplateValidator{TemplateValidator: templateValidator}).SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "ClusterTemplate")

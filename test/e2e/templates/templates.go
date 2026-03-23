@@ -21,7 +21,9 @@ import (
 	"strings"
 	"time"
 
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -31,20 +33,22 @@ import (
 type Type string
 
 const (
-	TemplateAWSStandaloneCP     Type = "aws-standalone-cp"
-	TemplateAWSHostedCP         Type = "aws-hosted-cp"
-	TemplateAWSEKS              Type = "aws-eks"
-	TemplateAzureStandaloneCP   Type = "azure-standalone-cp"
-	TemplateAzureHostedCP       Type = "azure-hosted-cp"
-	TemplateAzureAKS            Type = "azure-aks"
-	TemplateGCPStandaloneCP     Type = "gcp-standalone-cp"
-	TemplateGCPHostedCP         Type = "gcp-hosted-cp"
-	TemplateGCPGKE              Type = "gcp-gke"
-	TemplateVSphereStandaloneCP Type = "vsphere-standalone-cp"
-	TemplateVSphereHostedCP     Type = "vsphere-hosted-cp"
-	TemplateAdoptedCluster      Type = "adopted-cluster"
-	TemplateRemoteCluster       Type = "remote-cluster"
-	TemplateDockerCluster       Type = "docker-hosted-cp"
+	TemplateAWSStandaloneCP       Type = "aws-standalone-cp"
+	TemplateAWSHostedCP           Type = "aws-hosted-cp"
+	TemplateAWSEKS                Type = "aws-eks"
+	TemplateAzureStandaloneCP     Type = "azure-standalone-cp"
+	TemplateAzureHostedCP         Type = "azure-hosted-cp"
+	TemplateAzureAKS              Type = "azure-aks"
+	TemplateGCPStandaloneCP       Type = "gcp-standalone-cp"
+	TemplateGCPHostedCP           Type = "gcp-hosted-cp"
+	TemplateGCPGKE                Type = "gcp-gke"
+	TemplateOpenStackStandaloneCP Type = "openstack-standalone-cp"
+	TemplateOpenStackHostedCP     Type = "openstack-hosted-cp"
+	TemplateVSphereStandaloneCP   Type = "vsphere-standalone-cp"
+	TemplateVSphereHostedCP       Type = "vsphere-hosted-cp"
+	TemplateAdoptedCluster        Type = "adopted-cluster"
+	TemplateRemoteCluster         Type = "remote-cluster"
+	TemplateDockerCluster         Type = "docker-hosted-cp"
 )
 
 // Types is an array of all the supported template types
@@ -58,6 +62,8 @@ var Types = []Type{
 	TemplateGCPStandaloneCP,
 	TemplateGCPHostedCP,
 	TemplateGCPGKE,
+	TemplateOpenStackStandaloneCP,
+	TemplateOpenStackHostedCP,
 	TemplateVSphereStandaloneCP,
 	TemplateVSphereHostedCP,
 	TemplateAdoptedCluster,
@@ -144,6 +150,31 @@ func CreateServiceTemplate(ctx context.Context, client crclient.Client, namespac
 		Spec: spec,
 	}
 	createAndWaitForValid(ctx, client, obj, "ServiceTemplate")
+}
+
+func CreateServiceTemplateWithDelete(ctx context.Context, client crclient.Client, namespace, name string, spec kcmv1.ServiceTemplateSpec) func() error {
+	CreateServiceTemplate(ctx, client, namespace, name, spec)
+
+	st := &kcmv1.ServiceTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      name,
+		},
+		Spec: spec,
+	}
+
+	stKey := crclient.ObjectKeyFromObject(st)
+	return func() error {
+		if err := client.Delete(ctx, st); crclient.IgnoreNotFound(err) != nil {
+			return err
+		}
+		Eventually(func() bool {
+			err := client.Get(ctx, stKey, &kcmv1.ServiceTemplate{})
+			return apierrors.IsNotFound(err)
+		}).WithTimeout(5 * time.Minute).WithPolling(3 * time.Second).Should(BeTrue())
+		_, _ = fmt.Fprintf(GinkgoWriter, "Deleted ServiceTemplate %s\n", stKey)
+		return nil
+	}
 }
 
 // CreateTemplateChain creates a ServiceTemplateChain and waits for it to become valid

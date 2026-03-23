@@ -27,7 +27,6 @@ import (
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
-	pointerutil "github.com/K0rdent/kcm/internal/util/pointer"
 	"github.com/K0rdent/kcm/test/e2e/logs"
 )
 
@@ -61,20 +60,20 @@ func WaitVirtualMachineReady(ctx context.Context, cl crclient.Client, namespace,
 	Eventually(func() bool {
 		vm, err := GetVirtualMachine(ctx, cl, namespace, name)
 		if err != nil {
-			logs.Println(err.Error())
+			logs.WarnErrorf(err, "failed to get virtual machine")
 			return false
 		}
 		if !vm.Status.Ready {
 			for _, condition := range vm.Status.Conditions {
 				if condition.Type == kubevirtv1.VirtualMachineReady {
-					logs.Println(fmt.Sprintf("Virtual Machine %s/%s is not ready yet. Reason: %s. Message: %s", namespace, name, condition.Reason, condition.Message))
+					logs.Printf("Virtual Machine %s/%s is not ready yet. Reason: %s. Message: %s", namespace, name, condition.Reason, condition.Message)
 					return false
 				}
 			}
-			logs.Println(fmt.Sprintf("Virtual Machine %s/%s is not ready yet. Ready condition is not found", namespace, name))
+			logs.Printf("Virtual Machine %s/%s is not ready yet. Ready condition is not found", namespace, name)
 			return false
 		}
-		logs.Println("Virtual Machine is ready")
+		logs.Printf("Virtual Machine is ready")
 		return true
 	}).WithTimeout(5 * time.Minute).WithPolling(10 * time.Second).Should(BeTrue())
 }
@@ -107,7 +106,7 @@ func getDefaultVirtualMachineSpec(namespace, name, publicSSHKey string) kubevirt
 								corev1.ResourceStorage: defaultStorageRequest,
 							},
 						},
-						StorageClassName: pointerutil.To("standard"),
+						StorageClassName: new("standard"),
 					},
 					Source: &cdiv1.DataVolumeSource{
 						HTTP: &cdiv1.DataVolumeSourceHTTP{
@@ -162,7 +161,7 @@ func getDefaultDevices() kubevirtv1.Devices {
 				DiskDevice: kubevirtv1.DiskDevice{
 					CDRom: &kubevirtv1.CDRomTarget{
 						Bus:      kubevirtv1.DiskBusSATA, // no arm support
-						ReadOnly: pointerutil.To(true),
+						ReadOnly: new(true),
 					},
 				},
 				Name: "cloudinitdisk",

@@ -40,6 +40,7 @@ type ReconcileHelmReleaseOpts struct {
 	ChartRef          *helmcontrollerv2.CrossNamespaceSourceReference
 	ReconcileInterval *time.Duration
 	Install           *helmcontrollerv2.Install
+	Upgrade           *helmcontrollerv2.Upgrade
 	KubeConfigRef     *fluxmeta.SecretKeyReference
 	Labels            map[string]string
 
@@ -99,6 +100,9 @@ func ReconcileHelmRelease(ctx context.Context,
 		}
 		if opts.Install != nil {
 			hr.Spec.Install = opts.Install
+		}
+		if opts.Upgrade != nil {
+			hr.Spec.Upgrade = opts.Upgrade
 		}
 		if opts.KubeConfigRef != nil {
 			hr.Spec.KubeConfig = &fluxmeta.KubeConfigReference{

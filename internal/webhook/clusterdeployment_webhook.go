@@ -21,11 +21,9 @@ import (
 	"slices"
 
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/api/equality"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	kcmv1 "github.com/K0rdent/kcm/api/v1beta1"
@@ -45,25 +43,19 @@ var errClusterUpgradeForbidden = errors.New("cluster upgrade is forbidden")
 
 func (v *ClusterDeploymentValidator) SetupWebhookWithManager(mgr ctrl.Manager) error {
 	v.Client = mgr.GetClient()
-	return ctrl.NewWebhookManagedBy(mgr).
-		For(&kcmv1.ClusterDeployment{}).
+	return ctrl.NewWebhookManagedBy(mgr, &kcmv1.ClusterDeployment{}).
 		WithValidator(v).
 		WithDefaulter(v).
 		Complete()
 }
 
 var (
-	_ webhook.CustomValidator = &ClusterDeploymentValidator{}
-	_ webhook.CustomDefaulter = &ClusterDeploymentValidator{}
+	_ admission.Validator[*kcmv1.ClusterDeployment] = &ClusterDeploymentValidator{}
+	_ admission.Defaulter[*kcmv1.ClusterDeployment] = &ClusterDeploymentValidator{}
 )
 
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type.
-func (v *ClusterDeploymentValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	clusterDeployment, ok := obj.(*kcmv1.ClusterDeployment)
-	if !ok {
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected clusterDeployment but got a %T", obj))
-	}
-
+func (v *ClusterDeploymentValidator) ValidateCreate(ctx context.Context, clusterDeployment *kcmv1.ClusterDeployment) (admission.Warnings, error) {
 	template, err := v.getClusterDeploymentTemplate(ctx, clusterDeployment.Namespace, clusterDeployment.Spec.Template)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", invalidClusterDeploymentMsg, err)
@@ -97,15 +89,7 @@ func (v *ClusterDeploymentValidator) ValidateCreate(ctx context.Context, obj run
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type.
-func (v *ClusterDeploymentValidator) ValidateUpdate(ctx context.Context, oldObj, newObj runtime.Object) (admission.Warnings, error) {
-	oldClusterDeployment, ok := oldObj.(*kcmv1.ClusterDeployment)
-	if !ok {
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected ClusterDeployment but got a %T", oldObj))
-	}
-	newClusterDeployment, ok := newObj.(*kcmv1.ClusterDeployment)
-	if !ok {
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected ClusterDeployment but got a %T", newObj))
-	}
+func (v *ClusterDeploymentValidator) ValidateUpdate(ctx context.Context, oldClusterDeployment, newClusterDeployment *kcmv1.ClusterDeployment) (admission.Warnings, error) {
 	oldTemplate := oldClusterDeployment.Spec.Template
 	newTemplate := newClusterDeployment.Spec.Template
 
@@ -133,41 +117,34 @@ func (v *ClusterDeploymentValidator) ValidateUpdate(ctx context.Context, oldObj,
 		}
 	}
 
-	if err := validationutil.ClusterDeployCredential(ctx, v.Client, v.SystemNamespace, newClusterDeployment, template); err != nil {
-		return nil, fmt.Errorf("%s: %w", invalidClusterDeploymentMsg, err)
+	if oldClusterDeployment.Spec.Credential != newClusterDeployment.Spec.Credential {
+		if err := validationutil.ClusterDeployCredential(ctx, v.Client, v.SystemNamespace, newClusterDeployment, template); err != nil {
+			return nil, fmt.Errorf("%s: %w", invalidClusterDeploymentMsg, err)
+		}
 	}
 
-	if err := validationutil.ServicesHaveValidTemplates(ctx, v.Client, newClusterDeployment.Spec.ServiceSpec.Services, newClusterDeployment.Namespace); err != nil {
-		return nil, fmt.Errorf("%s: %w", invalidClusterDeploymentMsg, err)
-	}
+	oldServices := oldClusterDeployment.Spec.ServiceSpec.Services
+	newServices := newClusterDeployment.Spec.ServiceSpec.Services
+	if !equality.Semantic.DeepEqual(oldServices, newServices) {
+		if err := validationutil.ServicesHaveValidTemplates(ctx, v.Client, newServices, newClusterDeployment.Namespace); err != nil {
+			return nil, fmt.Errorf("%s: %w", invalidClusterDeploymentMsg, err)
+		}
 
-	if err := validationutil.ValidateServiceDependencyOverall(newClusterDeployment.Spec.ServiceSpec.Services); err != nil {
-		return nil, fmt.Errorf("%s: %w", invalidClusterDeploymentMsg, err)
+		if err := validationutil.ValidateServiceDependencyOverall(newServices); err != nil {
+			return nil, fmt.Errorf("%s: %w", invalidClusterDeploymentMsg, err)
+		}
 	}
 
 	return nil, nil
 }
 
 // ValidateDelete implements webhook.Validator so a webhook will be registered for the type.
-func (v *ClusterDeploymentValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (admission.Warnings, error) {
-	clusterDeployment, ok := obj.(*kcmv1.ClusterDeployment)
-	if !ok {
-		return nil, apierrors.NewBadRequest(fmt.Sprintf("expected clusterDeployment but got a %T", obj))
-	}
-	err := validationutil.ClusterDeploymentDeletionAllowed(ctx, v.Client, clusterDeployment)
-	if err != nil {
-		return nil, err
-	}
-	return nil, nil
+func (v *ClusterDeploymentValidator) ValidateDelete(ctx context.Context, clusterDeployment *kcmv1.ClusterDeployment) (admission.Warnings, error) {
+	return nil, validationutil.ClusterDeploymentDeletionAllowed(ctx, v.Client, clusterDeployment)
 }
 
 // Default implements webhook.Defaulter so a webhook will be registered for the type.
-func (v *ClusterDeploymentValidator) Default(ctx context.Context, obj runtime.Object) error {
-	clusterDeployment, ok := obj.(*kcmv1.ClusterDeployment)
-	if !ok {
-		return apierrors.NewBadRequest(fmt.Sprintf("expected clusterDeployment but got a %T", obj))
-	}
-
+func (v *ClusterDeploymentValidator) Default(ctx context.Context, clusterDeployment *kcmv1.ClusterDeployment) error {
 	// Only apply defaults when there's no configuration provided;
 	// if template ref is empty, then nothing to default
 	if clusterDeployment.Spec.Config != nil || clusterDeployment.Spec.Template == "" {

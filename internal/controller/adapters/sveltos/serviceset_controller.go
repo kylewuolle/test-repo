@@ -19,11 +19,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
 
-	"dario.cat/mergo"
 	"github.com/Masterminds/semver/v3"
 	fluxmeta "github.com/fluxcd/pkg/apis/meta"
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
@@ -40,13 +40,14 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/json"
-	"k8s.io/utils/ptr"
 	clusterapiv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	kcmv1 "github.com/K0rdent/kcm/api/v1beta1"
 	"github.com/K0rdent/kcm/internal/record"
@@ -59,6 +60,7 @@ import (
 )
 
 const (
+	defaultTier             = 100
 	sveltosDriftIgnorePatch = `- op: add
   path: /metadata/annotations/projectsveltos.io~1driftDetectionIgnore
   value: ok`
@@ -72,6 +74,7 @@ var (
 	errBuildHelmChartsFailed        = errors.New("failed to build helm charts")
 	errBuildKustomizationRefsFailed = errors.New("failed to build kustomization refs")
 	errBuildPolicyRefsFailed        = errors.New("failed to build policy refs")
+	errNoMatchingClusters           = errors.New("no matching clusters for ServiceSet")
 )
 
 type profileConfig struct {
@@ -82,6 +85,7 @@ type profileConfig struct {
 	// when checking for drift.
 	DriftIgnore []libsveltosv1beta1.PatchSelector `json:"driftIgnore,omitempty"`
 
+	StopMatchingBehavior string                                       `json:"stopMatchingBehavior,omitempty"`
 	SyncMode             string                                       `json:"syncMode,omitempty"`
 	TemplateResourceRefs []addoncontrollerv1beta1.TemplateResourceRef `json:"templateResourceRefs,omitempty"`
 	PolicyRefs           []addoncontrollerv1beta1.PolicyRef           `json:"policyRefs,omitempty"`
@@ -97,44 +101,19 @@ type profileConfig struct {
 type ServiceSetReconciler struct {
 	client.Client
 
-	timeFunc func() time.Time
+	timeFunc  func() time.Time
+	eventChan chan event.GenericEvent
 
 	SystemNamespace string
+
 	// AdapterName is the name of the workload running the controller
 	// effectively this name is used to identify adapter in the
 	// [github.com/k0rdent/kcm/api/v1beta1.StateManagementProvider] spec.
 	AdapterName      string
 	AdapterNamespace string
 
-	requeueInterval time.Duration
-}
-
-func (r *ServiceSetReconciler) getRegionalClient(ctx context.Context, serviceSet *kcmv1.ServiceSet) (client.Client, error) {
-	if serviceSet.Spec.Cluster == "" {
-		// The ServiceSet created for self-managing the management cluster has
-		// empty .spec.cluster because it isn't matching any ClusterDeployment.
-		// So we return the management cluster client in this case.
-		return r.Client, nil
-	}
-
-	cd := new(kcmv1.ClusterDeployment)
-	cdKey := client.ObjectKey{Namespace: serviceSet.Namespace, Name: serviceSet.Spec.Cluster}
-	if err := r.Get(ctx, cdKey, cd); err != nil {
-		return nil, fmt.Errorf("failed to get %s ClusterDeployment: %w", cdKey, err)
-	}
-
-	cred := new(kcmv1.Credential)
-	credKey := client.ObjectKey{Namespace: cd.Namespace, Name: cd.Spec.Credential}
-	if err := r.Get(ctx, credKey, cred); err != nil {
-		return nil, fmt.Errorf("failed to get %s Credential: %w", credKey, err)
-	}
-
-	rgnClient, err := kubeutil.GetRegionalClientByRegionName(ctx, r.Client, r.SystemNamespace, cred.Spec.Region, schemeutil.GetRegionalSchemeWithSveltos)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get regional client: %w", err)
-	}
-
-	return rgnClient, nil
+	MaxConcurrentReconciles int
+	requeueInterval         time.Duration
 }
 
 func (r *ServiceSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
@@ -152,7 +131,7 @@ func (r *ServiceSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	rgnClient, err := r.getRegionalClient(ctx, serviceSet)
+	rgnClient, err := getRegionalClient(ctx, r.Client, serviceSet, r.SystemNamespace)
 	if err != nil {
 		l.Error(err, "failed to get regional client")
 		return ctrl.Result{}, err
@@ -182,51 +161,99 @@ func (r *ServiceSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	clone := serviceSet.DeepCopy()
 	defer func() {
-		fillNotDeployedServices(serviceSet, r.timeFunc)
-		if !equality.Semantic.DeepEqual(clone.Status, serviceSet.Status) {
-			err = errors.Join(err, r.Status().Update(ctx, serviceSet))
+		// we won't update serviceSet anyhow in case of any error
+		// occurred during reconciliation, by returning error
+		// serviceSet object being reconciled will be requeued
+		// with respect of rate limits
+		if err != nil {
+			return
 		}
 
-		if !equality.Semantic.DeepEqual(clone.Spec.Services, serviceSet.Spec.Services) {
-			err = errors.Join(err, r.Update(ctx, serviceSet))
+		fillNotDeployedServices(serviceSet, r.timeFunc)
+		// if serviceSet status changed we'll update object's
+		// status, so object being reconciled will be requeued,
+		// otherwise we'll do nothing since the poller will
+		// enqueue serviceSet object in case any changes in
+		// corresponding ClusterSummary object.
+		if !equality.Semantic.DeepEqual(clone.Status, serviceSet.Status) {
+			err = r.Status().Update(ctx, serviceSet)
 		}
 		l.Info("ServiceSet reconciled", "duration", time.Since(start))
 	}()
 
+	serviceSet.Status.Cluster = clusterReference(serviceSet)
 	serviceSet.Status.Provider = kcmv1.ProviderState{
 		Ready:     smp.Status.Ready,
 		Suspended: smp.Spec.Suspend,
 	}
 	if !smp.Status.Ready {
-		record.Eventf(serviceSet, serviceSet.Generation, kcmv1.StateManagementProviderNotReadyEvent,
-			"StateManagementProvider %s not ready, skipping ServiceSet %s reconciliation", smp.Name, serviceSet.Name)
+		// we'll emit StateManagementProviderNotReadyEvent
+		// only in case the previous observed state was "ready".
+		if clone.Status.Provider.Ready {
+			record.Eventf(serviceSet, smp, kcmv1.StateManagementProviderNotReadyEvent, kcmv1.ServiceSetReconcileEventAction,
+				"StateManagementProvider %s not ready, skipping ServiceSet %s reconciliation", smp.Name, serviceSet.Name)
+		}
 		l.Info("StateManagementProvider is not ready, skipping", "provider", serviceSet.Spec.Provider)
 		return ctrl.Result{}, nil
 	}
 	if smp.Spec.Suspend {
-		record.Eventf(serviceSet, serviceSet.Generation, kcmv1.StateManagementProviderSuspendedEvent,
-			"StateManagementProvider %s suspended, skipping ServiceSet %s reconciliation", smp.Name, serviceSet.Name)
+		// we'll emit StateManagementProviderSuspendedEvent
+		// only in case the previous observed state was not "suspended".
+		if !clone.Status.Provider.Suspended {
+			record.Eventf(serviceSet, smp, kcmv1.StateManagementProviderSuspendedEvent, kcmv1.ServiceSetReconcileEventAction,
+				"StateManagementProvider %s suspended, skipping ServiceSet %s reconciliation", smp.Name, serviceSet.Name)
+		}
 		l.Info("StateManagementProvider is suspended, skipping", "provider", serviceSet.Spec.Provider)
 		return ctrl.Result{}, nil
 	}
 
 	// first we'll ensure the profile exists and up-to-date
 	if err = r.ensureProfile(ctx, rgnClient, serviceSet); err != nil {
-		record.Warnf(serviceSet, serviceSet.Generation, kcmv1.ServiceSetEnsureProfileFailedEvent,
-			"Failed to ensure Profile for ServiceSet %s: %v", serviceSet.Name, err)
+		conditionOldState := apimeta.FindStatusCondition(clone.Status.Conditions, kcmv1.ServiceSetProfileCondition)
+		conditionNewState := apimeta.FindStatusCondition(serviceSet.Status.Conditions, kcmv1.ServiceSetProfileCondition)
+		// we'll emit ServiceSetEnsureProfileFailedEvent warning
+		// only in case the previous observed state was ok.
+		if conditionStatusChangedToFalse(conditionOldState, conditionNewState) {
+			record.Warnf(serviceSet, nil, kcmv1.ServiceSetEnsureProfileFailedEvent, kcmv1.ServiceSetEnsureProfileEventAction,
+				"Failed to ensure Profile for ServiceSet %s: %v", serviceSet.Name, err)
+		}
+
+		// we'll emit failure-specific events in case failure reason was changed
+		if !conditionReasonChanged(conditionOldState, conditionNewState) {
+			return ctrl.Result{}, err
+		}
+
+		switch conditionNewState.Reason {
+		case kcmv1.ServiceSetProfileBuildFailedReason:
+			record.Warnf(serviceSet, nil, kcmv1.ServiceSetProfileBuildFailedEvent, kcmv1.ServiceSetBuildProfileEventAction,
+				"Failed to build Profile for ServiceSet %s: %v", serviceSet.Name, err)
+		case kcmv1.ServiceSetHelmChartsBuildFailedReason:
+			record.Warnf(serviceSet, nil, kcmv1.ServiceSetHelmChartsBuildFailedEvent, kcmv1.ServiceSetBuildHelmChartsEventAction,
+				"Failed to get Helm charts for ServiceSet %s: %v", serviceSet.Name, err)
+		case kcmv1.ServiceSetKustomizationRefsBuildFailedReason:
+			record.Warnf(serviceSet, nil, kcmv1.ServiceSetKustomizationRefsBuildFailedEvent, kcmv1.ServiceSetBuildKustomizationRefsEventAction,
+				"Failed to get Kustomization refs for ServiceSet %s: %v", serviceSet.Name, err)
+		case kcmv1.ServiceSetPolicyRefsBuildFailedReason:
+			record.Warnf(serviceSet, nil, kcmv1.ServiceSetPolicyRefsBuildFailedEvent, kcmv1.ServiceSetBuildPolicyRefsEventAction,
+				"Failed to get Policy refs for ServiceSet %s: %v", serviceSet.Name, err)
+		}
+
 		return ctrl.Result{}, err
 	}
 	// then we'll collect the statuses of the services
-	requeue, err := r.collectServiceStatuses(ctx, rgnClient, serviceSet)
+	err = r.collectServiceStatuses(ctx, rgnClient, serviceSet)
 	if err != nil {
-		record.Warnf(serviceSet, serviceSet.Generation, kcmv1.ServiceSetCollectServiceStatusesFailedEvent,
-			"Failed to collect Service statuses for ServiceSet %s: %v", serviceSet.Name, err)
+		conditionOldState := apimeta.FindStatusCondition(clone.Status.Conditions, kcmv1.ServiceSetStatusesCollectedCondition)
+		conditionNewState := apimeta.FindStatusCondition(serviceSet.Status.Conditions, kcmv1.ServiceSetStatusesCollectedCondition)
+		// we'll emit ServiceSetCollectServiceStatusesFailedEvent warning
+		// only in case the previous observed state was ok.
+		if conditionStatusChangedToFalse(conditionOldState, conditionNewState) {
+			record.Warnf(serviceSet, nil, kcmv1.ServiceSetCollectServiceStatusesFailedEvent, kcmv1.ServiceSetCollectServiceStatusesEventAction,
+				"Failed to collect Service statuses for ServiceSet %s: %v", serviceSet.Name, err)
+		}
 		return ctrl.Result{}, err
 	}
 
-	if requeue || r.processUpgrades(serviceSet) {
-		return ctrl.Result{RequeueAfter: r.requeueInterval}, nil
-	}
 	return ctrl.Result{}, nil
 }
 
@@ -245,7 +272,7 @@ func (r *ServiceSetReconciler) reconcileDelete(ctx context.Context, rgnClient cl
 			}
 			newState := state.DeepCopy()
 			newState.State = kcmv1.ServiceStateDeleting
-			newState.LastStateTransitionTime = pointerutil.To(metav1.NewTime(r.timeFunc()))
+			newState.LastStateTransitionTime = new(metav1.NewTime(r.timeFunc()))
 			serviceStates = append(serviceStates, *newState)
 		}
 		serviceSet.Status.Services = serviceStates
@@ -297,6 +324,22 @@ func (r *ServiceSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.timeFunc = time.Now
 	}
 	r.requeueInterval = 10 * time.Second
+
+	// in case reconciliation will slowdown and occasionally poller will produce
+	// events faster than controller will reconcile objects, we will have a 10-fold
+	// capacity reserve for event channel.
+	r.eventChan = make(chan event.GenericEvent, r.MaxConcurrentReconciles*10)
+
+	poller := &Poller{
+		Client:          r.Client,
+		requeueInterval: r.requeueInterval,
+		eventChan:       r.eventChan,
+		systemNamespace: r.SystemNamespace,
+	}
+
+	if err := mgr.Add(poller); err != nil {
+		return fmt.Errorf("failed to add poller to manager: %w", err)
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		WithOptions(controller.TypedOptions[ctrl.Request]{
@@ -350,6 +393,7 @@ func (r *ServiceSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 			return requests
 		})).
+		WatchesRawSource(source.Channel(r.eventChan, &handler.EnqueueRequestForObject{})).
 		Complete(r)
 }
 
@@ -359,7 +403,7 @@ func (r *ServiceSetReconciler) ensureProfile(ctx context.Context, rgnClient clie
 	start := time.Now()
 	l := ctrl.LoggerFrom(ctx)
 	l.Info("Ensuring ProjectSveltos Profile")
-	profileCondition, _ := findCondition(serviceSet, kcmv1.ServiceSetProfileCondition)
+	profileCondition := findCondition(serviceSet, kcmv1.ServiceSetProfileCondition)
 
 	status := metav1.ConditionFalse
 	reason := kcmv1.ServiceSetProfileNotReadyReason
@@ -368,7 +412,7 @@ func (r *ServiceSetReconciler) ensureProfile(ctx context.Context, rgnClient clie
 	defer func() {
 		if updateCondition(serviceSet, profileCondition, status, reason, message, r.timeFunc()) && status == metav1.ConditionTrue {
 			l.Info("Successfully ensured ProjectSveltos Profile")
-			record.Eventf(serviceSet, serviceSet.Generation, kcmv1.ServiceSetEnsureProfileSuccessEvent,
+			record.Eventf(serviceSet, nil, kcmv1.ServiceSetEnsureProfileSuccessEvent, kcmv1.ServiceSetEnsureProfileEventAction,
 				"Successfully ensured ProjectSveltos Profile for ServiceSet %s", serviceSet.Name)
 		}
 		l.V(1).Info("Finished ensuring ProjectSveltos Profile", "duration", time.Since(start))
@@ -439,8 +483,9 @@ func (*ServiceSetReconciler) createOrUpdateProfile(ctx context.Context, rgnClien
 		if err = rgnClient.Create(ctx, profile); err != nil {
 			return fmt.Errorf("failed to create Profile for ServiceSet %s: %w", serviceSet.Name, err)
 		}
-	// if profile spec is not equal to the spec we just created,
-	// we need to update it
+	// If profile spec is not equal to the spec we just created so
+	// we need to update it. Make sure that the empty values in `spec`
+	// are defaulted otherwise comparison will always return false.
 	case annotationsUpdated || !equality.Semantic.DeepEqual(profile.Spec, *spec):
 		profile.OwnerReferences = []metav1.OwnerReference{*ownerReference}
 		profile.Spec = *spec
@@ -476,15 +521,16 @@ func (*ServiceSetReconciler) createOrUpdateClusterProfile(ctx context.Context, r
 		profile.OwnerReferences = []metav1.OwnerReference{*ownerReference}
 		profile.Spec = *spec
 		if err = rgnClient.Create(ctx, profile); err != nil {
-			return fmt.Errorf("failed to create Profile for ServiceSet %s: %w", serviceSet.Name, err)
+			return fmt.Errorf("failed to create ClusterProfile for ServiceSet %s: %w", serviceSet.Name, err)
 		}
-	// if profile spec is not equal to the spec we just created,
-	// we need to update it
+	// If profile spec is not equal to the spec we just created so
+	// we need to update it. Make sure that the empty values in `spec`
+	// are defaulted otherwise comparison will always return false.
 	case annotationsUpdated || !equality.Semantic.DeepEqual(profile.Spec, *spec):
 		profile.OwnerReferences = []metav1.OwnerReference{*ownerReference}
 		profile.Spec = *spec
 		if err = rgnClient.Update(ctx, profile); err != nil {
-			return fmt.Errorf("failed to update Profile for ServiceSet %s: %w", serviceSet.Name, err)
+			return fmt.Errorf("failed to update ClusterProfile for ServiceSet %s: %w", serviceSet.Name, err)
 		}
 	}
 	return nil
@@ -514,21 +560,13 @@ func handlePauseAnnotations(profile *metav1.ObjectMeta, serviceSet *kcmv1.Servic
 func (r *ServiceSetReconciler) profileSpec(ctx context.Context, rgnClient client.Client, serviceSet *kcmv1.ServiceSet) (*addoncontrollerv1beta1.Spec, error) {
 	var (
 		clusterSelector             libsveltosv1beta1.Selector
-		clusterReference            corev1.ObjectReference
+		clusterRef                  corev1.ObjectReference
 		clusterTemplateResourceRefs []addoncontrollerv1beta1.TemplateResourceRef
 		clusterPolicyRefs           []addoncontrollerv1beta1.PolicyRef
 		err                         error
 	)
 	if serviceSet.Spec.Provider.SelfManagement {
-		clusterSelector = libsveltosv1beta1.Selector{
-			LabelSelector: metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					kcmv1.K0rdentManagementClusterLabelKey: kcmv1.K0rdentManagementClusterLabelValue,
-					"sveltos-agent":                        "present",
-				},
-			},
-		}
-		clusterReference = corev1.ObjectReference{
+		clusterRef = corev1.ObjectReference{
 			Kind:       libsveltosv1beta1.SveltosClusterKind,
 			Namespace:  managementSveltosCluster,
 			Name:       managementSveltosCluster,
@@ -551,7 +589,7 @@ func (r *ServiceSetReconciler) profileSpec(ctx context.Context, rgnClient client
 		if err := r.Get(ctx, key, cred); err != nil {
 			return nil, fmt.Errorf("failed to get Credential: %w", err)
 		}
-		clusterReference, err = r.getClusterReference(ctx, rgnClient, client.ObjectKeyFromObject(cd))
+		clusterRef, err = r.getClusterReference(ctx, rgnClient, client.ObjectKeyFromObject(cd))
 		if err != nil {
 			return nil, fmt.Errorf("failed to get ClusterReference for ClusterDeployment %s/%s: %w", cd.Namespace, cd.Name, err)
 		}
@@ -566,36 +604,29 @@ func (r *ServiceSetReconciler) profileSpec(ctx context.Context, rgnClient client
 
 	spec, err := buildProfileSpec(serviceSet.Spec.Provider.Config)
 	if err != nil && !errors.Is(err, errEmptyConfig) {
-		record.Warnf(serviceSet, serviceSet.Generation, kcmv1.ServiceSetProfileBuildFailedEvent,
-			"Failed to build Profile for ServiceSet %s: %v", serviceSet.Name, err)
 		return nil, errors.Join(errBuildProfileFromConfigFailed, err)
 	}
 	spec.ClusterSelector = clusterSelector
-	spec.ClusterRefs = []corev1.ObjectReference{clusterReference}
+	spec.ClusterRefs = []corev1.ObjectReference{clusterRef}
 	spec.TemplateResourceRefs = append(spec.TemplateResourceRefs, clusterTemplateResourceRefs...)
 
 	helmCharts, err := getHelmCharts(ctx, r.Client, serviceSet)
 	if err != nil {
-		record.Warnf(serviceSet, serviceSet.Generation, kcmv1.ServiceSetHelmChartsBuildFailedEvent,
-			"Failed to get Helm charts for ServiceSet %s: %v", serviceSet.Name, err)
 		return nil, errors.Join(errBuildHelmChartsFailed, err)
 	}
 	kustomizationRefs, err := getKustomizationRefs(ctx, r.Client, serviceSet)
 	if err != nil {
-		record.Warnf(serviceSet, serviceSet.Generation, kcmv1.ServiceSetKustomizationRefsBuildFailedEvent,
-			"Failed to get KustomizationRefs for ServiceSet %s: %v", serviceSet.Name, err)
 		return nil, errors.Join(errBuildKustomizationRefsFailed, err)
 	}
 	policyRefs, err := getPolicyRefs(ctx, r.Client, serviceSet)
 	if err != nil {
-		record.Warnf(serviceSet, serviceSet.Generation, kcmv1.ServiceSetPolicyRefsBuildFailedEvent,
-			"Failed to get PolicyRefs for ServiceSet %s: %v", serviceSet.Name, err)
 		return nil, errors.Join(errBuildPolicyRefsFailed, err)
 	}
 	policyRefs = append(policyRefs, clusterPolicyRefs...)
 	spec.HelmCharts = helmCharts
 	spec.KustomizationRefs = kustomizationRefs
 	spec.PolicyRefs = append(spec.PolicyRefs, policyRefs...)
+	applyProfileSpecDefaults(spec)
 	return spec, nil
 }
 
@@ -633,48 +664,65 @@ func (*ServiceSetReconciler) getClusterReference(ctx context.Context, rgnClient 
 	return corev1.ObjectReference{}, err
 }
 
-func (*ServiceSetReconciler) collectServiceStatuses(ctx context.Context, rgnClient client.Client, serviceSet *kcmv1.ServiceSet) (requeue bool, err error) {
+func (r *ServiceSetReconciler) collectServiceStatuses(ctx context.Context, rgnClient client.Client, serviceSet *kcmv1.ServiceSet) (err error) {
 	start := time.Now()
 	l := ctrl.LoggerFrom(ctx)
 	l.Info("Collecting Service statuses")
+	statusesCollectedCondition := findCondition(serviceSet, kcmv1.ServiceSetStatusesCollectedCondition)
+
+	status := metav1.ConditionFalse
+	reason := kcmv1.ServiceSetStatusesNotCollectedReason
+	message := kcmv1.ServiceSetStatusesNotCollectedMessage
+
+	defer func() {
+		if updateCondition(serviceSet, statusesCollectedCondition, status, reason, message, r.timeFunc()) && status == metav1.ConditionTrue {
+			l.Info("Successfully collected services statuses")
+			record.Eventf(serviceSet, nil, kcmv1.ServiceSetCollectServiceStatusesSuccessEvent, kcmv1.ServiceSetCollectServiceStatusesEventAction,
+				"Successfully collected service statuses for ServiceSet %s", serviceSet.Name)
+		}
+		l.V(1).Info("Finished services status collection", "duration", time.Since(start))
+	}()
 
 	if serviceSet.Spec.Provider.SelfManagement {
 		clusterProfile := new(addoncontrollerv1beta1.ClusterProfile)
 		key := client.ObjectKeyFromObject(serviceSet)
 		if err := rgnClient.Get(ctx, key, clusterProfile); err != nil {
-			return false, fmt.Errorf("failed to get ClusterProfile: %w", err)
+			return fmt.Errorf("failed to get ClusterProfile: %w", err)
 		}
 
 		l.V(1).Info("Found matching ClusterProfile", "ClusterProfile", client.ObjectKeyFromObject(clusterProfile))
-		requeue, err = collectServiceStatusesFromProfileOrClusterProfile(ctx, rgnClient, serviceSet, clusterProfile)
+		err = collectServiceStatusesFromProfileOrClusterProfile(ctx, rgnClient, serviceSet, clusterProfile)
 	} else {
 		profile := new(addoncontrollerv1beta1.Profile)
 		key := client.ObjectKeyFromObject(serviceSet)
 		if err := rgnClient.Get(ctx, key, profile); err != nil {
-			return false, fmt.Errorf("failed to get Profile: %w", err)
+			return fmt.Errorf("failed to get Profile: %w", err)
 		}
 
 		l.V(1).Info("Found matching Profile", "Profile", client.ObjectKeyFromObject(profile))
-		requeue, err = collectServiceStatusesFromProfileOrClusterProfile(ctx, rgnClient, serviceSet, profile)
+		err = collectServiceStatusesFromProfileOrClusterProfile(ctx, rgnClient, serviceSet, profile)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to collect service statuses: %w", err)
 	}
 
-	l.Info("Collecting Service statuses completed", "duration", time.Since(start))
-	return requeue, err
+	status = metav1.ConditionTrue
+	reason = kcmv1.ServiceSetStatusesCollectedReason
+	message = kcmv1.ServiceSetStatusesCollectedMessage
+	return nil
 }
 
-func collectServiceStatusesFromProfileOrClusterProfile(ctx context.Context, rgnClient client.Client, serviceSet *kcmv1.ServiceSet, profileObj client.Object) (requeue bool, _ error) {
+func getClusterSummaryForServiceSet(ctx context.Context, rgnClient client.Client, serviceSet *kcmv1.ServiceSet, profileObj client.Object) (*addoncontrollerv1beta1.ClusterSummary, error) {
 	l := ctrl.LoggerFrom(ctx)
 
 	var (
 		matchingRefs []corev1.ObjectReference
 		profileKind  string
 		profileName  string
-		profileSpec  addoncontrollerv1beta1.Spec
 	)
 
 	switch p := profileObj.(type) {
 	case *addoncontrollerv1beta1.Profile:
-		profileSpec = p.Spec
 		matchingRefs = p.Status.MatchingClusterRefs
 		profileKind = addoncontrollerv1beta1.ProfileKind
 		profileName = p.Name
@@ -683,16 +731,15 @@ func collectServiceStatusesFromProfileOrClusterProfile(ctx context.Context, rgnC
 		matchingRefs = p.Status.MatchingClusterRefs
 		profileKind = addoncontrollerv1beta1.ClusterProfileKind
 		profileName = p.Name
-		profileSpec = p.Spec
 		l.V(1).Info("Processing ClusterProfile", "clusterProfile", client.ObjectKeyFromObject(p))
 	default:
-		return false, fmt.Errorf("unsupported profile type: %T", profileObj)
+		return nil, fmt.Errorf("unsupported profile type: %T", profileObj)
 	}
 
 	if len(matchingRefs) == 0 {
 		l.Info("No matching clusters found for ServiceSet")
 		serviceSet.Status.Deployed = false
-		return true, nil
+		return nil, errNoMatchingClusters
 	}
 
 	// Use the first matching cluster reference for both types because:
@@ -714,57 +761,29 @@ func collectServiceStatusesFromProfileOrClusterProfile(ctx context.Context, rgnC
 	summary := new(addoncontrollerv1beta1.ClusterSummary)
 	summaryRef := client.ObjectKey{Name: summaryName, Namespace: obj.Namespace}
 	if err := rgnClient.Get(ctx, summaryRef, summary); err != nil {
-		return false, fmt.Errorf("failed to get ClusterSummary %s to fetch status: %w", summaryRef.String(), err)
+		return nil, fmt.Errorf("failed to get ClusterSummary %s to fetch status: %w", summaryRef.String(), err)
+	}
+	return summary, nil
+}
+
+func collectServiceStatusesFromProfileOrClusterProfile(ctx context.Context, rgnClient client.Client, serviceSet *kcmv1.ServiceSet, profileObj client.Object) (_ error) {
+	l := ctrl.LoggerFrom(ctx)
+
+	summary, err := getClusterSummaryForServiceSet(ctx, rgnClient, serviceSet, profileObj)
+	if errors.Is(err, errNoMatchingClusters) {
+		return nil
+	}
+	if err != nil {
+		return err
 	}
 
-	l.V(1).Info("Found matching ClusterSummary", "summary", summaryRef)
-
-	// if the clustersummary profile spec does not match our profile spec then the reconciliation hasn't happened yet
-	if !equality.Semantic.DeepEqual(summary.Spec.ClusterProfileSpec, profileSpec) {
-		l.V(1).Info("ClusterSummary status is not up to date. Not updating status.", "summary", summary)
-		return true, nil
-	}
-
+	l.V(1).Info("Found matching ClusterSummary", "summary", client.ObjectKeyFromObject(summary))
 	serviceSet.Status.Services = servicesStateFromSummary(l, summary, serviceSet)
 	serviceSet.Status.Deployed = !slices.ContainsFunc(serviceSet.Status.Services, func(s kcmv1.ServiceState) bool {
 		return s.State != kcmv1.ServiceStateDeployed
 	})
 
-	requeue = !serviceSet.Status.Deployed
-	return requeue, nil
-}
-
-func (*ServiceSetReconciler) processUpgrades(set *kcmv1.ServiceSet) bool {
-	upgradedServiceMap := make(map[string]bool)
-
-	requeue := false
-	// Mark upgraded services
-	for _, svcStatus := range set.Status.Services {
-		if svcStatus.State != kcmv1.ServiceStateDeployed {
-			continue
-		}
-
-		for i, svc := range set.Spec.Services {
-			if svc.Name == svcStatus.Name &&
-				svc.Namespace == svcStatus.Namespace &&
-				svc.Template == svcStatus.Template &&
-				svc.Version == svcStatus.Version {
-				set.Spec.Services[i].Upgrade = false
-				upgradedServiceMap[svc.Name] = true
-				requeue = true
-			}
-		}
-	}
-
-	// Mark pending as false for upgraded services
-	for i, svc := range set.Spec.Services {
-		if upgradedServiceMap[svc.Name] {
-			requeue = true
-			set.Spec.Services[i].Pending = false
-		}
-	}
-
-	return requeue
+	return nil
 }
 
 // getHelmCharts returns slice of helm chart options to use with Sveltos.
@@ -773,9 +792,6 @@ func getHelmCharts(ctx context.Context, c client.Client, serviceSet *kcmv1.Servi
 	helmCharts := make([]addoncontrollerv1beta1.HelmChart, 0)
 	namespace := serviceSet.Namespace
 	for _, svc := range serviceSet.Spec.Services {
-		if svc.Pending {
-			continue
-		}
 		tmpl, err := serviceTemplateObjectFromService(ctx, c, svc, namespace)
 		if err != nil {
 			return nil, err
@@ -803,18 +819,22 @@ func getHelmCharts(ctx context.Context, c client.Client, serviceSet *kcmv1.Servi
 			return nil, err
 		}
 
+		if svc.HelmAction != nil {
+			helmChart.HelmChartAction = addoncontrollerv1beta1.HelmChartAction(*svc.HelmAction)
+		}
+
 		helmCharts = append(helmCharts, helmChart)
 
 		if !slices.ContainsFunc(serviceSet.Status.Services, func(s kcmv1.ServiceState) bool {
 			return s.Name == svc.Name && s.Namespace == svc.Namespace
 		}) {
 			serviceStatus := kcmv1.ServiceState{
-				LastStateTransitionTime: pointerutil.To(metav1.Now()),
+				LastStateTransitionTime: new(metav1.Now()),
 				Type:                    kcmv1.ServiceTypeHelm,
 				Name:                    svc.Name,
 				Namespace:               svc.Namespace,
 				Template:                svc.Template,
-				Version:                 svc.Template,
+				Version:                 svc.Version,
 				State:                   kcmv1.ServiceStateProvisioning,
 			}
 			serviceSet.Status.Services = append(serviceSet.Status.Services, serviceStatus)
@@ -906,17 +926,11 @@ func helmChartFromSpecOrRef(
 	}
 
 	helmOptions := template.Spec.HelmOptions
-	if template.Spec.HelmOptions == nil {
-		helmOptions = &kcmv1.ServiceHelmOptions{}
+	if helmOptions == nil {
+		helmOptions = svc.HelmOptions
 	}
 
-	if svc.HelmOptions != nil {
-		err = mergo.Merge(&helmOptions, svc.HelmOptions, mergo.WithAppendSlice)
-		if err != nil {
-			return addoncontrollerv1beta1.HelmChart{}, err
-		}
-	}
-
+	mergeHelmOptions(svc.HelmOptions, helmOptions)
 	helmChart = addoncontrollerv1beta1.HelmChart{
 		Values:        svc.Values,
 		ValuesFrom:    convertValuesFrom(svc.ValuesFrom, namespace),
@@ -933,9 +947,52 @@ func helmChartFromSpecOrRef(
 			return svc.Name
 		}(),
 		RegistryCredentialsConfig: registryCredentialsConfig,
-		Options:                   convertHelmOptions(*helmOptions),
+		Options:                   convertHelmOptions(helmOptions),
 	}
 	return helmChart, nil
+}
+
+// mergeHelmOptions merges the values from the given source ServiceHelmOptions to the destination ServiceHelmOptions
+func mergeHelmOptions(src, dst *kcmv1.ServiceHelmOptions) {
+	if src == nil || dst == nil {
+		return
+	}
+
+	sv := reflect.ValueOf(src).Elem()
+	dv := reflect.ValueOf(dst).Elem()
+
+	for i := range sv.NumField() {
+		sf := sv.Field(i)
+		df := dv.Field(i)
+
+		if !df.CanSet() {
+			continue
+		}
+
+		if sf.Kind() == reflect.Pointer && !sf.IsNil() && sf.Elem().Kind() == reflect.Map {
+			srcMap := sf.Elem()
+
+			if df.IsNil() {
+				df.Set(sf)
+				continue
+			}
+
+			if df.Elem().IsNil() {
+				newMap := reflect.MakeMap(srcMap.Type())
+				df.Elem().Set(newMap)
+			}
+
+			dstMap := df.Elem()
+			for _, k := range srcMap.MapKeys() {
+				dstMap.SetMapIndex(k, srcMap.MapIndex(k))
+			}
+			continue
+		}
+
+		if !sf.IsZero() {
+			df.Set(sf)
+		}
+	}
 }
 
 // generateRegistryCredentialsConfig returns a RegistryCredentialsConfig object.
@@ -988,30 +1045,24 @@ func helmChartFromFluxSource(
 		return helmChart, fmt.Errorf("status for ServiceTemplate %s/%s has not been updated yet", template.Namespace, template.Name)
 	}
 
-	source := template.Spec.Helm.ChartSource
+	chartSource := template.Spec.Helm.ChartSource
 	status := template.Status.SourceStatus
-	sanitizedPath := strings.TrimPrefix(strings.TrimPrefix(source.Path, "."), "/")
+	sanitizedPath := strings.TrimPrefix(strings.TrimPrefix(chartSource.Path, "."), "/")
 	url := fmt.Sprintf("%s://%s/%s/%s", status.Kind, status.Namespace, status.Name, sanitizedPath)
 
 	helmOptions := template.Spec.HelmOptions
-	if template.Spec.HelmOptions == nil {
-		helmOptions = &kcmv1.ServiceHelmOptions{}
+	if helmOptions == nil {
+		helmOptions = svc.HelmOptions
 	}
 
-	if svc.HelmOptions != nil {
-		err := mergo.Merge(&helmOptions, svc.HelmOptions, mergo.WithAppendSlice)
-		if err != nil {
-			return addoncontrollerv1beta1.HelmChart{}, err
-		}
-	}
-
+	mergeHelmOptions(svc.HelmOptions, helmOptions)
 	helmChart = addoncontrollerv1beta1.HelmChart{
 		RepositoryURL:    url,
 		ReleaseName:      svc.Name,
 		ReleaseNamespace: svc.Namespace,
 		Values:           svc.Values,
 		ValuesFrom:       convertValuesFrom(svc.ValuesFrom, namespace),
-		Options:          convertHelmOptions(*helmOptions),
+		Options:          convertHelmOptions(helmOptions),
 	}
 
 	return helmChart, nil
@@ -1051,12 +1102,12 @@ func getKustomizationRefs(ctx context.Context, c client.Client, serviceSet *kcmv
 			return s.Name == svc.Name && s.Namespace == svc.Namespace
 		}) {
 			serviceStatus := kcmv1.ServiceState{
-				LastStateTransitionTime: pointerutil.To(metav1.Now()),
+				LastStateTransitionTime: new(metav1.Now()),
 				Type:                    kcmv1.ServiceTypeKustomize,
 				Name:                    svc.Name,
 				Namespace:               svc.Namespace,
 				Template:                svc.Template,
-				Version:                 svc.Template,
+				Version:                 svc.Version,
 				State:                   kcmv1.ServiceStateProvisioning,
 			}
 			serviceSet.Status.Services = append(serviceSet.Status.Services, serviceStatus)
@@ -1097,12 +1148,12 @@ func getPolicyRefs(ctx context.Context, c client.Client, serviceSet *kcmv1.Servi
 			return s.Name == svc.Name && s.Namespace == svc.Namespace
 		}) {
 			serviceStatus := kcmv1.ServiceState{
-				LastStateTransitionTime: pointerutil.To(metav1.Now()),
+				LastStateTransitionTime: new(metav1.Now()),
 				Type:                    kcmv1.ServiceTypeResource,
 				Name:                    svc.Name,
 				Namespace:               svc.Namespace,
 				Template:                svc.Template,
-				Version:                 svc.Template,
+				Version:                 svc.Version,
 				State:                   kcmv1.ServiceStateProvisioning,
 			}
 			serviceSet.Status.Services = append(serviceSet.Status.Services, serviceStatus)
@@ -1141,9 +1192,16 @@ func convertValuesFrom(src []kcmv1.ValuesFrom, namespace string) []addoncontroll
 	return valueFrom
 }
 
-func convertHelmOptions(options kcmv1.ServiceHelmOptions) *addoncontrollerv1beta1.HelmOptions {
+func convertHelmOptions(options *kcmv1.ServiceHelmOptions) *addoncontrollerv1beta1.HelmOptions {
+	if options == nil {
+		return nil
+	}
 	toReturn := addoncontrollerv1beta1.HelmOptions{
 		Timeout: options.Timeout,
+	}
+
+	if options.InstallOptions != nil {
+		toReturn.InstallOptions = *options.InstallOptions
 	}
 
 	if options.SkipCRDs != nil {
@@ -1158,8 +1216,8 @@ func convertHelmOptions(options kcmv1.ServiceHelmOptions) *addoncontrollerv1beta
 		toReturn.Wait = *options.Wait
 	}
 
-	if options.CreateNamespace != nil {
-		toReturn.InstallOptions.CreateNamespace = *options.CreateNamespace
+	if options.CreateNamespace != nil { //nolint:staticcheck // required for backwards compatibility
+		toReturn.InstallOptions.CreateNamespace = *options.CreateNamespace //nolint:staticcheck
 	}
 
 	if options.WaitForJobs != nil {
@@ -1194,11 +1252,19 @@ func convertHelmOptions(options kcmv1.ServiceHelmOptions) *addoncontrollerv1beta
 		toReturn.Description = *options.Description
 	}
 
-	if options.Replace != nil {
-		toReturn.InstallOptions.Replace = *options.Replace
+	if options.Replace != nil { //nolint:staticcheck // required for backwards compatibility
+		toReturn.InstallOptions.Replace = *options.Replace //nolint:staticcheck
 	}
 	if options.DisableHooks != nil {
 		toReturn.InstallOptions.DisableHooks = *options.DisableHooks
+	}
+
+	if options.UpgradeOptions != nil {
+		toReturn.UpgradeOptions = *options.UpgradeOptions
+	}
+
+	if options.UninstallOptions != nil {
+		toReturn.UninstallOptions = *options.UninstallOptions
 	}
 
 	return &toReturn
@@ -1220,12 +1286,18 @@ func buildProfileSpec(config *apiextv1.JSON) (*addoncontrollerv1beta1.Spec, erro
 		return nil, fmt.Errorf("failed to unmarshal raw config to profile configuration: %w", err)
 	}
 
-	tier, err := priorityToTier(ptr.Deref(params.Priority, int32(100)))
+	tier, err := priorityToTier(pointerutil.Deref(params.Priority, int32(defaultTier)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert priority to tier: %w", err)
 	}
 
+	stopMatchingBehavior := addoncontrollerv1beta1.WithdrawPolicies
+	if params.StopMatchingBehavior == string(addoncontrollerv1beta1.LeavePolicies) {
+		stopMatchingBehavior = addoncontrollerv1beta1.LeavePolicies
+	}
+
 	spec.Tier = tier
+	spec.StopMatchingBehavior = stopMatchingBehavior
 	spec.SyncMode = addoncontrollerv1beta1.SyncMode(params.SyncMode)
 	spec.ContinueOnConflict = !params.StopOnConflict
 	spec.ContinueOnError = params.ContinueOnError
@@ -1241,7 +1313,44 @@ func buildProfileSpec(config *apiextv1.JSON) (*addoncontrollerv1beta1.Spec, erro
 			Patch:  sveltosDriftIgnorePatch,
 		})
 	}
+
 	return spec, nil
+}
+
+// applyProfileSpecDefaults applies defaults to fields that have not been set.
+// When comparing specs to decide whether to reconcile or not, we compare this
+// spec to the spec fetched from kube which already has the defaults applied to it.
+// Therefore, we use this func to apply defaults so that the comparison is accurate.
+//
+// TODO: Maybe we can implement a more generic way of applying the defaults
+// by either fetching the Sveltos Profile CRD and getting the defaults from
+// it or from the JSON schema for Profile once the following is implemented:
+// https://github.com/k0rdent/kcm/issues/2234
+func applyProfileSpecDefaults(spec *addoncontrollerv1beta1.Spec) {
+	if spec.SyncMode == "" {
+		spec.SyncMode = addoncontrollerv1beta1.SyncModeContinuous
+	}
+	if spec.Tier == 0 {
+		spec.Tier = defaultTier
+	}
+	if spec.StopMatchingBehavior == "" {
+		spec.StopMatchingBehavior = addoncontrollerv1beta1.WithdrawPolicies
+	}
+	for i := range spec.PolicyRefs {
+		if spec.PolicyRefs[i].DeploymentType == "" {
+			spec.PolicyRefs[i].DeploymentType = addoncontrollerv1beta1.DeploymentTypeRemote
+		}
+	}
+	for i := range spec.HelmCharts {
+		if spec.HelmCharts[i].HelmChartAction == "" {
+			spec.HelmCharts[i].HelmChartAction = addoncontrollerv1beta1.HelmChartActionInstall
+		}
+	}
+	for i := range spec.KustomizationRefs {
+		if spec.KustomizationRefs[i].DeploymentType == "" {
+			spec.KustomizationRefs[i].DeploymentType = addoncontrollerv1beta1.DeploymentTypeRemote
+		}
+	}
 }
 
 // priorityToTier converts priority value to Sveltos tier value.
@@ -1282,7 +1391,7 @@ func fillNotDeployedServices(serviceSet *kcmv1.ServiceSet, now func() time.Time)
 			Namespace:               service.Namespace,
 			Template:                service.Template,
 			State:                   kcmv1.ServiceStateNotDeployed,
-			LastStateTransitionTime: pointerutil.To(metav1.NewTime(now())),
+			LastStateTransitionTime: new(metav1.NewTime(now())),
 		})
 	}
 }
@@ -1346,14 +1455,12 @@ func labelsMatchSelector(serviceSetLabels map[string]string, selector *metav1.La
 
 // findCondition finds the condition of the given type in the ServiceSet.
 // If no condition is found, a new condition of given type is created.
-func findCondition(serviceSet *kcmv1.ServiceSet, conditionType string) (metav1.Condition, bool) {
-	var created bool
+func findCondition(serviceSet *kcmv1.ServiceSet, conditionType string) metav1.Condition {
 	condition := apimeta.FindStatusCondition(serviceSet.Status.Conditions, conditionType)
 	if condition == nil {
 		condition = &metav1.Condition{Type: conditionType, ObservedGeneration: serviceSet.Generation}
-		created = true
 	}
-	return *condition, created
+	return *condition
 }
 
 // updateCondition updates the given condition of the ServiceSet.
@@ -1375,33 +1482,56 @@ func updateCondition(
 	return apimeta.SetStatusCondition(&serviceSet.Status.Conditions, condition)
 }
 
+// conditionStatusChangedToFalse returns true if the condition status changed to False
+// while previous observed condition status was equal to True or was not defined.
+func conditionStatusChangedToFalse(conditionOldState, conditionNewState *metav1.Condition) bool {
+	if conditionOldState == nil && conditionNewState == nil {
+		return false
+	}
+	if conditionOldState == nil && conditionNewState.Status == metav1.ConditionFalse {
+		return true
+	}
+	return conditionOldState != nil && conditionNewState != nil && conditionOldState.Status != conditionNewState.Status &&
+		conditionNewState.Status == metav1.ConditionFalse
+}
+
+func conditionReasonChanged(conditionOldState, conditionNewState *metav1.Condition) bool {
+	if conditionOldState == nil && conditionNewState == nil {
+		return false
+	}
+	if conditionNewState == nil {
+		return false
+	}
+	if conditionOldState == nil {
+		return true
+	}
+	return conditionOldState.Reason != conditionNewState.Reason
+}
+
 func servicesStateFromSummary(
 	logger logr.Logger,
 	summary *addoncontrollerv1beta1.ClusterSummary,
 	serviceSet *kcmv1.ServiceSet,
 ) []kcmv1.ServiceState {
-	logger.Info("Collecting services state from summary")
+	logger.Info("Collecting services state from ClusterSummary", "cluster_summary", client.ObjectKeyFromObject(summary))
 	// we'll recreate service states list according to the desired services
 	states := make([]kcmv1.ServiceState, 0, len(serviceSet.Spec.Services))
 	servicesMap := make(map[client.ObjectKey]kcmv1.ServiceState)
 	for _, service := range serviceSet.Spec.Services {
-		if !service.Pending {
-			servicesMap[client.ObjectKey{
-				Namespace: service.Namespace,
-				Name:      service.Name,
-			}] = kcmv1.ServiceState{
-				Type:                    "",
-				LastStateTransitionTime: nil,
-				Name:                    service.Name,
-				Namespace:               service.Namespace,
-				Template:                service.Template,
-				Version:                 service.Version,
-				State:                   kcmv1.ServiceStateProvisioning,
-				FailureMessage:          "",
-			}
+		servicesMap[client.ObjectKey{
+			Namespace: service.Namespace,
+			Name:      service.Name,
+		}] = kcmv1.ServiceState{
+			Type:                    "",
+			LastStateTransitionTime: nil,
+			Name:                    service.Name,
+			Namespace:               service.Namespace,
+			Template:                service.Template,
+			Version:                 service.Version,
+			State:                   kcmv1.ServiceStateProvisioning,
+			FailureMessage:          "",
 		}
 	}
-	logger.V(1).Info("Desired services map", "servicesMap", servicesMap)
 
 	hasKustomizations := len(summary.Spec.ClusterProfileSpec.KustomizationRefs) > 0
 	hasPolicies := len(summary.Spec.ClusterProfileSpec.PolicyRefs) > 0
@@ -1473,12 +1603,12 @@ func servicesStateFromSummary(
 			if deployed {
 				newState.State = kcmv1.ServiceStateDeployed
 			}
-			if helmChartsFailureMessage != "" {
+			if !deployed && helmChartsFailureMessage != "" {
 				newState.State = kcmv1.ServiceStateFailed
 				newState.FailureMessage = helmChartsFailureMessage
 			}
 			if newState.State != s.State {
-				newState.LastStateTransitionTime = pointerutil.To(metav1.Now())
+				newState.LastStateTransitionTime = new(metav1.Now())
 			}
 		case kcmv1.ServiceTypeKustomize:
 			if kustomizationsDeployed {
@@ -1501,4 +1631,50 @@ func servicesStateFromSummary(
 	}
 	logger.V(1).Info("Collected services state from summary", "states", states)
 	return states
+}
+
+// getRegionalClient returns local or regional kubernetes client depending on the target cluster type.
+func getRegionalClient(ctx context.Context, cl client.Client, serviceSet *kcmv1.ServiceSet, systemNamespace string) (client.Client, error) {
+	if serviceSet.Spec.Cluster == "" {
+		// The ServiceSet created for self-managing the management cluster has
+		// empty .spec.cluster because it isn't matching any ClusterDeployment.
+		// So we return the management cluster client in this case.
+		return cl, nil
+	}
+
+	cd := new(kcmv1.ClusterDeployment)
+	cdKey := client.ObjectKey{Namespace: serviceSet.Namespace, Name: serviceSet.Spec.Cluster}
+	if err := cl.Get(ctx, cdKey, cd); err != nil {
+		return nil, fmt.Errorf("failed to get %s ClusterDeployment: %w", cdKey, err)
+	}
+
+	cred := new(kcmv1.Credential)
+	credKey := client.ObjectKey{Namespace: cd.Namespace, Name: cd.Spec.Credential}
+	if err := cl.Get(ctx, credKey, cred); err != nil {
+		return nil, fmt.Errorf("failed to get %s Credential: %w", credKey, err)
+	}
+
+	rgnClient, err := kubeutil.GetRegionalClientByRegionName(ctx, cl, systemNamespace, cred.Spec.Region, schemeutil.GetRegionalSchemeWithSveltos)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get regional client: %w", err)
+	}
+
+	return rgnClient, nil
+}
+
+func clusterReference(serviceSet *kcmv1.ServiceSet) *corev1.ObjectReference {
+	if serviceSet.Spec.Provider.SelfManagement {
+		return &corev1.ObjectReference{
+			Kind:       libsveltosv1beta1.SveltosClusterKind,
+			Name:       "mgmt",
+			Namespace:  "mgmt",
+			APIVersion: libsveltosv1beta1.GroupVersion.WithKind(libsveltosv1beta1.SveltosClusterKind).GroupVersion().String(),
+		}
+	}
+	return &corev1.ObjectReference{
+		Kind:       kcmv1.ClusterDeploymentKind,
+		Name:       serviceSet.Spec.Cluster,
+		Namespace:  serviceSet.Namespace,
+		APIVersion: kcmv1.GroupVersion.WithKind(kcmv1.ClusterDeploymentKind).GroupVersion().String(),
+	}
 }

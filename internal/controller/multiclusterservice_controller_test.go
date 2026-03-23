@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"time"
 
 	helmcontrollerv2 "github.com/fluxcd/helm-controller/api/v2"
 	fluxmeta "github.com/fluxcd/pkg/apis/meta"
@@ -50,7 +51,7 @@ var _ = Describe("MultiClusterService Controller", func() {
 			clusterDeploymentName   = "test-clusterdeployment"
 		)
 
-		fakeDownloadHelmChartFunc := func(context.Context, *fluxmeta.Artifact) (*chart.Chart, error) {
+		fakeDownloadHelmChartFunc := func(_ context.Context, _, _ string) (*chart.Chart, error) {
 			return &chart.Chart{
 				Metadata: &chart.Metadata{
 					APIVersion: "v2",
@@ -305,7 +306,11 @@ var _ = Describe("MultiClusterService Controller", func() {
 
 		It("should successfully reconcile the resource", func() {
 			By("reconciling MultiClusterService")
-			multiClusterServiceReconciler := &MultiClusterServiceReconciler{Client: mgrClient, SystemNamespace: testSystemNamespace}
+			multiClusterServiceReconciler := &MultiClusterServiceReconciler{
+				Client:          mgrClient,
+				timeFunc:        func() time.Time { return time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC) },
+				SystemNamespace: testSystemNamespace,
+			}
 
 			Eventually(func(g Gomega) {
 				_, err := multiClusterServiceReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: multiClusterServiceRef})
